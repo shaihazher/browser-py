@@ -31,7 +31,7 @@ TOOL_SCHEMA = {
                     "type": "string",
                     "enum": [
                         "launch", "tabs", "open", "tab", "newtab", "close_tab",
-                        "elements", "click", "type", "text", "html", "eval",
+                        "search", "elements", "click", "type", "text", "html", "eval",
                         "screenshot", "scroll", "url", "back", "forward",
                         "refresh", "upload", "wait", "profiles",
                     ],
@@ -41,6 +41,7 @@ TOOL_SCHEMA = {
                         "- profiles: List available browser profiles\n"
                         "- tabs: List open tabs\n"
                         "- open: Navigate to URL (requires 'url')\n"
+                        "- search: Google search — returns clean result links with index numbers (requires 'query')\n"
                         "- tab: Switch to tab by index (requires 'index')\n"
                         "- newtab: Open new tab (optional: 'url')\n"
                         "- close_tab: Close tab (optional: 'index', default current)\n"
@@ -67,6 +68,7 @@ TOOL_SCHEMA = {
                 "amount": {"type": "integer", "description": "Scroll pixels (default 600)"},
                 "path": {"type": "string", "description": "File path for screenshot/upload"},
                 "ms": {"type": "integer", "description": "Milliseconds to wait"},
+                "query": {"type": "string", "description": "Search query for search action"},
                 "profile": {"type": "string", "description": "Browser profile name for launch"},
             },
             "required": ["action"],
@@ -87,6 +89,16 @@ class BrowserTool:
         self._default_profile = default_profile
         self._download_dir = download_dir
         self._opened_tabs: list[str] = []  # target IDs of tabs we opened
+        self._initial_tabs: set[str] = set()  # tabs that existed before agent started
+
+    def snapshot_tabs(self) -> None:
+        """Capture current tab IDs so cleanup knows what was pre-existing."""
+        if self._browser:
+            try:
+                self._initial_tabs = {p["id"] for p in self._browser._get_pages()
+                                      if "url" in p and not p["url"].startswith("devtools://")}
+            except Exception:
+                pass
 
     def _get_browser(self) -> Browser:
         """Get or create the browser connection."""
@@ -97,6 +109,9 @@ class BrowserTool:
                 self._browser = Browser(f"http://127.0.0.1:{profile['port']}")
                 # Test connection
                 self._browser.tabs()
+                # Snapshot existing tabs on first connect
+                if not self._initial_tabs:
+                    self.snapshot_tabs()
             except (ValueError, BrowserNotRunning):
                 self._browser = None
                 raise BrowserNotRunning("http://127.0.0.1:9222")
@@ -146,6 +161,44 @@ class BrowserTool:
             elif action == "close_tab":
                 idx = params.get("index")
                 return browser.close_tab(int(idx) if idx is not None else None)
+
+            elif action == "search":
+                query = params.get("query", "")
+                if not query:
+                    return "Error: 'query' parameter required for search action."
+                from urllib.parse import quote_plus
+                browser.open(f"https://www.google.com/search?q={quote_plus(query)}")
+                import time as _time
+                _time.sleep(2)
+                # Extract search result links via JS for full URLs
+                js = """(() => {
+                    const results = [];
+                    document.querySelectorAll('a[href]').forEach(a => {
+                        const href = a.href;
+                        if (!href || href.includes('google.com') || href.includes('youtube.com')
+                            || href.startsWith('javascript:') || href.includes('accounts.google')
+                            || href.includes('support.google') || href.includes('policies.google'))
+                            return;
+                        const text = (a.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 100);
+                        if (!text || text.length < 5) return;
+                        results.push({title: text, url: href});
+                    });
+                    // Dedupe by URL
+                    const seen = new Set();
+                    return results.filter(r => {
+                        const key = r.url.split('#')[0].split('?')[0];
+                        if (seen.has(key)) return false;
+                        seen.add(key);
+                        return true;
+                    }).slice(0, 10);
+                })()"""
+                raw = browser.eval(js)
+                if not raw:
+                    return "No search results found. Try a different query."
+                lines = []
+                for i, r in enumerate(raw):
+                    lines.append(f"[{i+1}] {r['title']}\n    {r['url']}")
+                return f"Search results for: {query}\n\n" + "\n".join(lines)
 
             elif action == "elements":
                 elements = browser.elements(params.get("selector"))
@@ -260,31 +313,44 @@ class BrowserTool:
     def cleanup(self) -> str:
         """Close all tabs opened during this agent session.
 
+        Closes any tab that wasn't present when the agent first connected.
+        Falls back to the explicit _opened_tabs list if no initial snapshot.
         Returns a summary of what was cleaned up.
         """
-        if not self._opened_tabs or not self._browser:
+        if not self._browser:
             self._opened_tabs.clear()
-            return "No tabs to clean up."
+            return "No browser connected."
 
         closed = 0
         try:
+            from urllib.request import urlopen
             pages = self._browser._get_pages()
-            page_ids = {p["id"] for p in pages}
-            for tid in self._opened_tabs:
-                if tid in page_ids:
-                    try:
-                        from urllib.request import urlopen
-                        urlopen(
-                            f"{self._browser.cdp_url}/json/close/{tid}",
-                            timeout=2,
-                        )
-                        closed += 1
-                    except Exception:
-                        pass
+
+            # Determine which tabs to close: anything not in the initial snapshot
+            if self._initial_tabs:
+                tabs_to_close = [
+                    p["id"] for p in pages
+                    if p["id"] not in self._initial_tabs
+                    and "url" in p
+                    and not p["url"].startswith("devtools://")
+                ]
+            else:
+                # Fallback: use explicit tracking list
+                page_ids = {p["id"] for p in pages}
+                tabs_to_close = [tid for tid in self._opened_tabs if tid in page_ids]
+
+            for tid in tabs_to_close:
+                try:
+                    urlopen(f"{self._browser.cdp_url}/json/close/{tid}", timeout=2)
+                    closed += 1
+                except Exception:
+                    pass
         except Exception:
             pass
 
         self._opened_tabs.clear()
+        # Reset initial snapshot for next session
+        self.snapshot_tabs()
         return f"Closed {closed} tab(s) opened during this session."
 
     def _list_profiles(self) -> str:

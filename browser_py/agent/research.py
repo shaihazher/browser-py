@@ -5,7 +5,7 @@ A parent agent decomposes a research query into subtopics, then spawns
 focused task. The parent compiles a final report from all findings.
 
 Usage:
-    from browser_py.agent.research import run_research
+    from browser_py.agentresearch import run_research
     report = run_research("What are the best Python web frameworks in 2025?")
 """
 
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import date
 from pathlib import Path
 from typing import Any, Callable
 
@@ -24,8 +25,8 @@ from browser_py.agent.loop import Agent
 NUM_SUB_AGENTS = 5
 
 PLANNER_PROMPT = """\
-You are a research planner. Given a research query, decompose it into exactly \
-{n} focused subtopics that can be independently researched.
+You are a research planner. Today's date is {today}. Given a research query, \
+decompose it into exactly {n} focused subtopics that can be independently researched.
 
 Each subtopic should be:
 - Specific enough to research in one focused session
@@ -47,27 +48,46 @@ Example format:
 Research query: {query}
 """
 
-SUB_AGENT_PROMPT = """\
-You are a focused research agent. Your task is to research ONE specific subtopic \
-thoroughly using the browser.
+SUB_AGENT_SYSTEM_PROMPT = """\
+You are a focused web research agent. Today's date is {today}.
 
+You have access to a browser, file tools, and other utilities. \
+Your workspace directory is: {workspace}
+
+## Research Workflow
+
+1. **Use browser action="search"** with a query to Google something. \
+It returns a clean list of result links with clickable index numbers.
+2. **Click results by index** using action="click" to visit a page.
+3. **Read page content** with action="text".
+4. **Write findings** to a file using the files tool.
+
+That's it: search → click → read → write. Aim for 2-3 sources per query.
+
+## Key Rules
+
+- Get URLs from search results. Use action="search" or action="elements" \
+to discover real links before visiting them.
+- Use action="text" to read article content (not elements).
+- Be efficient — finish in under 10 tool calls.
+"""
+
+SUB_AGENT_TASK_PROMPT = """\
 ## Your Research Task
 {task}
 
 ## Instructions
-1. Search the web for authoritative, recent information on this subtopic.
-2. Visit 2-3 relevant sources. Read the content carefully.
-3. Take notes on key findings, statistics, and insights.
-4. When done, write your findings to a file: {output_file}
+1. Search Google for this topic (use 1-2 well-crafted queries).
+2. Visit 2-3 sources from the search results.
+3. Read each source and extract key findings.
+4. Write your complete findings to: **{output_file}** (use the files tool, action="write").
 
-## Output Format
-Write a well-structured markdown document with:
-- Key findings (with bullet points)
-- Important statistics or data points
-- Notable quotes or insights (with source attribution)
-- Source URLs
+## Output Format (for the file)
+- Key findings with bullet points
+- Statistics and data points
+- Source URLs you visited
 
-Be thorough but concise. Focus on quality and accuracy.
+Write the file now — your research is only captured if it's saved there.
 """
 
 COMPILER_PROMPT = """\
@@ -117,22 +137,24 @@ class ResearchSession:
         self.browser_profile = browser_profile
         self.num_agents = num_agents
         self.workspace = get_workspace()
-        self.research_dir = self.workspace / ".research" / f"research_{int(time.time())}"
+        self.research_dir = self.workspace / "research" / f"research_{int(time.time())}"
         self.research_dir.mkdir(parents=True, exist_ok=True)
 
     def _progress(self, stage: str, message: str) -> None:
         self.on_progress(stage, message)
 
-    def _create_agent(self) -> Agent:
+    def _create_agent(self, system_prompt: str | None = None) -> Agent:
         """Create a fresh agent instance for a sub-task."""
         cfg = get_agent_config()
         agent = Agent(
             workspace=self.workspace,
             browser_profile=self.browser_profile or cfg.get("browser_profile"),
-            max_iterations=30,
+            max_iterations=500,
         )
         if not cfg.get("shell_enabled", True):
             agent._shell.enabled = False
+        if system_prompt:
+            agent._system_prompt = system_prompt
         return agent
 
     def plan(self) -> list[dict[str, str]]:
@@ -140,7 +162,8 @@ class ResearchSession:
         self._progress("planning", f"Breaking down query into {self.num_agents} subtopics...")
 
         agent = self._create_agent()
-        prompt = PLANNER_PROMPT.format(n=self.num_agents, query=self.query)
+        today = date.today().strftime("%B %d, %Y")
+        prompt = PLANNER_PROMPT.format(n=self.num_agents, query=self.query, today=today)
         try:
             response = agent.chat(prompt)
         finally:
@@ -194,7 +217,7 @@ class ResearchSession:
 
         Returns the path to the findings file.
         """
-        output_file = f".research/{self.research_dir.name}/findings_{index+1}.md"
+        output_file = f"research/{self.research_dir.name}/findings_{index+1}.md"
         abs_output = self.workspace / output_file
 
         self._progress(
@@ -202,14 +225,17 @@ class ResearchSession:
             f"Sub-agent {index+1}/{self.num_agents}: {subtopic['subtopic']}",
         )
 
-        agent = self._create_agent()
-        prompt = SUB_AGENT_PROMPT.format(
+        today = date.today().strftime("%B %d, %Y")
+        system = SUB_AGENT_SYSTEM_PROMPT.format(today=today, workspace=self.workspace)
+        agent = self._create_agent(system_prompt=system)
+        prompt = SUB_AGENT_TASK_PROMPT.format(
             task=subtopic["task"],
             output_file=output_file,
         )
 
+        response = ""
         try:
-            agent.chat(prompt)
+            response = agent.chat(prompt)
         except Exception as e:
             # Write error findings
             abs_output.write_text(
@@ -223,11 +249,16 @@ class ResearchSession:
             except Exception:
                 pass
 
-        # If the agent didn't write the file, write what we got from its response
-        if not abs_output.exists():
+        # If the agent didn't write the file, save its chat response as findings
+        if not abs_output.exists() and response.strip():
+            abs_output.parent.mkdir(parents=True, exist_ok=True)
+            abs_output.write_text(
+                f"# {subtopic['subtopic']}\n\n{response}\n"
+            )
+        elif not abs_output.exists():
             abs_output.write_text(
                 f"# {subtopic['subtopic']}\n\n"
-                f"*No findings file was created by the sub-agent.*\n"
+                f"*No findings were produced by the sub-agent.*\n"
             )
 
         self._progress(
@@ -253,7 +284,7 @@ class ResearchSession:
                 content = "*Findings file not found*"
             findings_text += f"\n### Sub-Agent {i+1} Findings\n\n{content}\n\n---\n"
 
-        output_file = f".research/{self.research_dir.name}/final_report.md"
+        output_file = f"research/{self.research_dir.name}/final_report.md"
 
         agent = self._create_agent()
         prompt = COMPILER_PROMPT.format(

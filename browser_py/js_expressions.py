@@ -114,7 +114,7 @@ def elements_js(selector: str | None = None) -> str:
         let desc = ariaLabel || text || placeholder || name || '';
         if (value && !desc.includes(value)) desc += desc ? ' [' + value + ']' : value;
         if (tag === 'a' && href && !href.startsWith('javascript:')) {{
-          const short = href.length > 60 ? href.slice(0, 57) + '...' : href;
+          const short = href;
           desc += desc ? ' → ' + short : short;
         }}
 

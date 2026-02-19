@@ -136,6 +136,7 @@ class Agent:
 
         # Session management
         self.session_id: str | None = None
+        self._last_prompt_tokens: int = 0  # context size from most recent LLM call
 
     def _setup_litellm(self) -> None:
         """Configure LiteLLM with the right provider credentials."""
@@ -211,8 +212,11 @@ class Agent:
         # Track token usage
         usage = getattr(response, "usage", None)
         if usage:
-            self.prompt_tokens += getattr(usage, "prompt_tokens", 0) or 0
-            self.completion_tokens += getattr(usage, "completion_tokens", 0) or 0
+            call_prompt = getattr(usage, "prompt_tokens", 0) or 0
+            call_completion = getattr(usage, "completion_tokens", 0) or 0
+            self._last_prompt_tokens = call_prompt
+            self.prompt_tokens += call_prompt
+            self.completion_tokens += call_completion
             self.total_tokens = self.prompt_tokens + self.completion_tokens
 
             if self.on_token_update:
@@ -233,8 +237,96 @@ class Agent:
 
         return result
 
+    def _check_context_compact(self) -> None:
+        """If context window usage exceeds 75%, dump and compact.
+
+        Uses the last API call's prompt_tokens as a proxy for current
+        context size (since it includes the full conversation each time).
+        """
+        from browser_py.agent.sessions import get_context_limit
+
+        model = get_model()
+        context_limit = get_context_limit(model)
+        threshold = int(context_limit * 0.75)
+
+        # _last_prompt_tokens tracks the most recent call's prompt size,
+        # which represents the actual current context window usage.
+        if self._last_prompt_tokens < threshold:
+            return
+
+        # Dump raw context to workspace
+        import time as _time
+        dump_path = self.workspace / "context_dumps" / f"dump_{int(_time.time())}.md"
+        dump_path.parent.mkdir(parents=True, exist_ok=True)
+
+        dump_lines = [
+            f"# Context Dump — {_time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Model: {model} | Tokens: {self.total_tokens:,} / {context_limit:,}",
+            f"Messages: {len(self.messages)}\n",
+        ]
+        for msg in self.messages:
+            role = msg.get("role", "?")
+            content = msg.get("content", "")
+            if msg.get("tool_calls"):
+                tc_info = ", ".join(
+                    tc["function"]["name"] for tc in msg["tool_calls"]
+                )
+                dump_lines.append(f"## [{role}] tool_calls: {tc_info}")
+                if content:
+                    dump_lines.append(content[:2000])
+            elif role == "tool":
+                dump_lines.append(f"## [tool] {msg.get('tool_call_id', '')}")
+                dump_lines.append((content or "")[:2000])
+            else:
+                dump_lines.append(f"## [{role}]")
+                dump_lines.append((content or "")[:5000])
+            dump_lines.append("")
+
+        dump_path.write_text("\n".join(dump_lines))
+
+        # Build summary by extracting key information from messages
+        summary_parts = ["## Conversation Summary (context compacted)\n"]
+        for msg in self.messages:
+            role = msg.get("role", "?")
+            content = msg.get("content", "")
+            if role == "user":
+                summary_parts.append(f"**User:** {content[:500]}")
+            elif role == "assistant" and content:
+                summary_parts.append(f"**Assistant:** {content[:1000]}")
+            elif role == "tool":
+                # Keep just the tool call id for reference
+                summary_parts.append(f"*[tool result: {len(content or '')} chars]*")
+
+        summary = "\n".join(summary_parts)
+        # Cap summary size
+        if len(summary) > 8000:
+            summary = summary[:8000] + "\n\n*[summary truncated]*"
+
+        # Replace messages with compact summary
+        self.messages.clear()
+        self.messages.append({
+            "role": "user",
+            "content": (
+                f"[Context was compacted at {self._last_prompt_tokens:,} prompt tokens "
+                f"({self.total_tokens:,} total used). "
+                f"Raw dump saved to: {dump_path.relative_to(self.workspace)}]\n\n"
+                f"{summary}\n\n"
+                "Continue from where we left off."
+            ),
+        })
+
+        # Reset token counts (the summary is much smaller)
+        self._last_prompt_tokens = 0
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.total_tokens = 0
+
     def chat(self, user_message: str) -> str:
         """Send a message and get a response. Handles multi-step tool loops.
+
+        Runs until the LLM produces a final text response (no more tool calls).
+        Context is automatically compacted when token usage exceeds 75% of
+        the model's context limit.
 
         Args:
             user_message: The user's message/task.
@@ -244,7 +336,18 @@ class Agent:
         """
         self.messages.append({"role": "user", "content": user_message})
 
-        for iteration in range(self.max_iterations):
+        # Snapshot current browser tabs so cleanup knows what's pre-existing
+        try:
+            self._browser.snapshot_tabs()
+        except Exception:
+            pass
+
+        iteration = 0
+        while True:
+            iteration += 1
+
+            # Check if context needs compacting before calling LLM
+            self._check_context_compact()
             response = self._call_llm()
             choice = response.choices[0]
             msg = choice.message
@@ -324,7 +427,9 @@ class Agent:
 
             # Continue loop — LLM will see tool results and decide next step
 
-        return "(Max iterations reached. The task may be incomplete.)"
+            # Safety valve — prevent truly infinite loops
+            if iteration >= 500:
+                return "(Safety limit: 500 iterations reached.)"
 
     def _try_parse_text_tool_call(self, text: str) -> dict | None:
         """Try to extract a tool call from text output.
@@ -374,7 +479,11 @@ class Agent:
         return text.strip()
 
     def reset(self) -> None:
-        """Clear conversation history and token counts."""
+        """Clear conversation history and token counts, clean up browser."""
+        try:
+            self.cleanup_browser()
+        except Exception:
+            pass
         self.messages.clear()
         self.total_tokens = 0
         self.prompt_tokens = 0

@@ -491,6 +491,29 @@ async def get_models(
     return JSONResponse({"models": models})
 
 
+@app.get("/api/browse-dirs")
+async def browse_dirs(path: str = "~") -> JSONResponse:
+    """List directories at a given path for folder picker."""
+    from pathlib import Path as P
+    resolved = P(path).expanduser().resolve()
+    if not resolved.is_dir():
+        return JSONResponse({"error": "Not a directory"}, status_code=400)
+    dirs = []
+    try:
+        for entry in sorted(resolved.iterdir()):
+            if entry.name.startswith("."):
+                continue
+            if entry.is_dir():
+                dirs.append(entry.name)
+    except PermissionError:
+        pass
+    return JSONResponse({
+        "current": str(resolved),
+        "parent": str(resolved.parent) if resolved != resolved.parent else None,
+        "dirs": dirs,
+    })
+
+
 @app.post("/api/setup")
 async def run_setup(body: dict) -> JSONResponse:
     """Full setup — provider, key, model, workspace, browser, shell."""
@@ -606,6 +629,12 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                     None, agent.chat, msg.get("message", "")
                 )
 
+                # Clean up browser tabs opened during this exchange
+                try:
+                    await loop.run_in_executor(None, agent.cleanup_browser)
+                except Exception:
+                    pass
+
                 # Auto-save session after each exchange
                 session_meta = await loop.run_in_executor(None, agent.save_session)
 
@@ -628,6 +657,12 @@ async def websocket_endpoint(ws: WebSocket) -> None:
     except WebSocketDisconnect:
         if ws in _ws_clients:
             _ws_clients.remove(ws)
+        # Clean up browser tabs when client disconnects
+        try:
+            if _agent:
+                _agent.cleanup_browser()
+        except Exception:
+            pass
 
 
 # ── Scheduler ──
@@ -975,6 +1010,33 @@ _FALLBACK_HTML = """\
   .context-warning .dismiss { float: right; cursor: pointer; opacity: 0.7; }
   .context-warning .dismiss:hover { opacity: 1; }
 
+  /* Folder picker modal */
+  .folder-modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+    z-index: 200; display: none; align-items: center; justify-content: center; }
+  .folder-modal-overlay.open { display: flex; }
+  .folder-modal { background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; width: 480px; max-height: 70vh; display: flex;
+    flex-direction: column; overflow: hidden; }
+  .folder-modal-header { padding: 14px 16px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between; }
+  .folder-modal-header h3 { font-size: 14px; margin: 0; }
+  .folder-modal-path { padding: 8px 16px; font-size: 12px; color: var(--text-dim);
+    border-bottom: 1px solid var(--border); word-break: break-all;
+    display: flex; align-items: center; gap: 6px; }
+  .folder-modal-path .path-text { flex: 1; font-family: monospace; }
+  .folder-modal-list { flex: 1; overflow-y: auto; padding: 4px 0; min-height: 200px; }
+  .folder-modal-list .folder-item { display: flex; align-items: center; gap: 8px;
+    padding: 7px 16px; cursor: pointer; font-size: 13px; color: var(--text); }
+  .folder-modal-list .folder-item:hover { background: rgba(255,255,255,0.05); }
+  .folder-modal-list .folder-item .icon { opacity: 0.5; }
+  .folder-modal-list .empty { padding: 16px; color: var(--text-dim); font-size: 13px;
+    text-align: center; }
+  .folder-modal-footer { padding: 12px 16px; border-top: 1px solid var(--border);
+    display: flex; gap: 8px; justify-content: flex-end; }
+  .folder-input-wrap { display: flex; gap: 6px; }
+  .folder-input-wrap input { flex: 1; }
+  .folder-input-wrap .btn { flex-shrink: 0; padding: 6px 12px; font-size: 12px; }
+
   /* Searchable model picker */
   .model-search-wrap { position: relative; }
   .model-search-wrap input { width: 100%; }
@@ -1092,7 +1154,10 @@ _FALLBACK_HTML = """\
           <p>All file operations are sandboxed to this directory.</p>
           <div class="field">
             <label>Path</label>
-            <input type="text" id="setup-workspace" placeholder="~/browser-py-workspace">
+            <div class="folder-input-wrap">
+              <input type="text" id="setup-workspace" placeholder="~/browser-py-workspace">
+              <button class="btn" onclick="openFolderPicker('setup-workspace')">Browse</button>
+            </div>
           </div>
         </div>
         <div class="wizard-nav">
@@ -1253,7 +1318,10 @@ _FALLBACK_HTML = """\
         <h3>Workspace</h3>
         <div class="field">
           <label>Directory</label>
-          <input type="text" id="cfg-workspace">
+          <div class="folder-input-wrap">
+            <input type="text" id="cfg-workspace">
+            <button class="btn" onclick="openFolderPicker('cfg-workspace')">Browse</button>
+          </div>
         </div>
       </div>
       <div class="card">
@@ -1273,12 +1341,90 @@ _FALLBACK_HTML = """\
   </div>
 </div>
 
+<!-- Folder picker modal -->
+<div class="folder-modal-overlay" id="folder-modal">
+  <div class="folder-modal">
+    <div class="folder-modal-header">
+      <h3>📁 Choose Workspace Directory</h3>
+      <span style="cursor:pointer;opacity:0.6" onclick="closeFolderPicker()">✕</span>
+    </div>
+    <div class="folder-modal-path">
+      <span class="icon" style="cursor:pointer" id="folder-up" onclick="folderUp()">⬆</span>
+      <span class="path-text" id="folder-current-path">/</span>
+    </div>
+    <div class="folder-modal-list" id="folder-list"></div>
+    <div class="folder-modal-footer">
+      <button class="btn" style="background:var(--border);color:var(--text)" onclick="closeFolderPicker()">Cancel</button>
+      <button class="btn" onclick="selectFolder()">Select This Folder</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const chatEl = document.getElementById('chat-messages');
 const inputEl = document.getElementById('input');
 const sendBtn = document.getElementById('send');
 const statusEl = document.getElementById('status');
 let ws, providers = {}, currentCfg = {};
+
+// ── Folder Picker ──
+let _folderTarget = null;  // id of the input to fill
+let _folderCurrent = '~';
+
+async function openFolderPicker(inputId) {
+  _folderTarget = inputId;
+  const existing = document.getElementById(inputId).value.trim();
+  _folderCurrent = existing || '~';
+  await loadFolder(_folderCurrent);
+  document.getElementById('folder-modal').classList.add('open');
+}
+
+function closeFolderPicker() {
+  document.getElementById('folder-modal').classList.remove('open');
+  _folderTarget = null;
+}
+
+async function loadFolder(path) {
+  const list = document.getElementById('folder-list');
+  list.innerHTML = '<div class="empty">Loading...</div>';
+  try {
+    const res = await fetch('/api/browse-dirs?path=' + encodeURIComponent(path));
+    const data = await res.json();
+    if (data.error) { list.innerHTML = `<div class="empty">${data.error}</div>`; return; }
+    _folderCurrent = data.current;
+    document.getElementById('folder-current-path').textContent = data.current;
+    if (!data.dirs.length) {
+      list.innerHTML = '<div class="empty">No subdirectories</div>';
+      return;
+    }
+    list.innerHTML = data.dirs.map(d =>
+      `<div class="folder-item" onclick="loadFolder('${(data.current + '/' + d).replace(/'/g, "\\'")}')">` +
+      `<span class="icon">📁</span>${d}</div>`
+    ).join('');
+  } catch (e) {
+    list.innerHTML = `<div class="empty">Error: ${e.message}</div>`;
+  }
+}
+
+function folderUp() {
+  const parts = _folderCurrent.split('/');
+  if (parts.length > 1) {
+    parts.pop();
+    loadFolder(parts.join('/') || '/');
+  }
+}
+
+function selectFolder() {
+  if (_folderTarget) {
+    document.getElementById(_folderTarget).value = _folderCurrent;
+  }
+  closeFolderPicker();
+}
+
+// Close folder modal on overlay click
+document.addEventListener('click', (e) => {
+  if (e.target.id === 'folder-modal') closeFolderPicker();
+});
 
 // ── Model Picker Component ──
 // A searchable combo-box that replaces the old <select>

@@ -747,7 +747,8 @@ def run_research_cli(args: list[str]) -> None:
     )
 
     print(f"\n{_green('Report saved to:')} {result['report_path']}")
-    print(f"{_dim(f'Duration: {result[\"duration_seconds\"]:.0f}s')}")
+    duration = result["duration_seconds"]
+    print(f"{_dim(f'Duration: {duration:.0f}s')}")
     print(f"\n{_bold('--- Report Preview ---')}\n")
     print(result["report"][:3000])
     if len(result["report"]) > 3000:

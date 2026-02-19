@@ -27,7 +27,7 @@ TOOL_SCHEMA = {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["read", "write", "list", "move", "copy", "delete", "mkdir", "info"],
+                    "enum": ["read", "write", "list", "move", "copy", "delete", "mkdir", "info", "grep"],
                     "description": (
                         "File action:\n"
                         "- read: Read file contents (requires 'path')\n"
@@ -37,11 +37,14 @@ TOOL_SCHEMA = {
                         "- copy: Copy file (requires 'path' and 'destination')\n"
                         "- delete: Delete file or directory (requires 'path')\n"
                         "- mkdir: Create directory (requires 'path')\n"
-                        "- info: Get file size, type, modification time (requires 'path')"
+                        "- info: Get file size, type, modification time (requires 'path')\n"
+                        "- grep: Search file contents (requires 'query', optional 'path' to scope to dir, optional 'glob' pattern)"
                     ),
                 },
                 "path": {"type": "string", "description": "File or directory path (relative to workspace)"},
                 "content": {"type": "string", "description": "File content for write action"},
+                "query": {"type": "string", "description": "Search query for grep action (case-insensitive)"},
+                "glob": {"type": "string", "description": "File glob pattern for grep (default: *.md,*.txt,*.py,*.json,*.csv)"},
                 "destination": {"type": "string", "description": "Destination path for move/copy"},
                 "encoding": {"type": "string", "description": "File encoding (default: utf-8)"},
             },
@@ -93,6 +96,8 @@ class FilesTool:
                 return self._mkdir(params)
             elif action == "info":
                 return self._info(params)
+            elif action == "grep":
+                return self._grep(params)
             else:
                 return f"Unknown action: {action}"
         except PermissionError as e:
@@ -228,3 +233,54 @@ class FilesTool:
         kind = "directory" if resolved.is_dir() else resolved.suffix or "file"
         size = stat.st_size
         return f"Path: {path}\nType: {kind}\nSize: {size} bytes\nModified: {mtime}"
+
+    def _grep(self, params: dict) -> str:
+        """Search file contents within the workspace."""
+        import re as _re
+
+        query = params.get("query", "")
+        if not query:
+            return "Error: 'query' required for grep"
+
+        scope = params.get("path", ".")
+        resolved_scope = self._resolve(scope)
+        if not resolved_scope.exists():
+            return f"Path not found: {scope}"
+
+        glob_pattern = params.get("glob", "")
+        patterns = [g.strip() for g in glob_pattern.split(",")] if glob_pattern else [
+            "*.md", "*.txt", "*.py", "*.json", "*.csv", "*.html", "*.js",
+        ]
+
+        search_dir = resolved_scope if resolved_scope.is_dir() else resolved_scope.parent
+        matches = []
+        pattern = _re.compile(_re.escape(query), _re.IGNORECASE)
+
+        for glob_pat in patterns:
+            for fpath in search_dir.rglob(glob_pat):
+                if not fpath.is_file():
+                    continue
+                # Skip hidden dirs and large files
+                parts = fpath.relative_to(self.workspace).parts
+                skip_dirs = {".git", "__pycache__", "node_modules", ".venv", ".env"}
+                if any(p in skip_dirs for p in parts):
+                    continue
+                if fpath.stat().st_size > 1_000_000:
+                    continue
+                try:
+                    text = fpath.read_text(errors="ignore")
+                except Exception:
+                    continue
+                for line_num, line in enumerate(text.splitlines(), 1):
+                    if pattern.search(line):
+                        rel = fpath.relative_to(self.workspace)
+                        matches.append(f"{rel}:{line_num}: {line.strip()[:150]}")
+                        if len(matches) >= 50:
+                            break
+                if len(matches) >= 50:
+                    break
+
+        if not matches:
+            return f"No matches for '{query}' in {scope}"
+        header = f"Found {len(matches)} match(es) for '{query}':\n\n"
+        return header + "\n".join(matches)
