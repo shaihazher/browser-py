@@ -153,6 +153,10 @@ class Agent:
         self.session_id: str | None = None
         self._last_prompt_tokens: int = 0  # context size from most recent LLM call
 
+        # Loop control
+        self._abort = False  # set True to stop the loop on next iteration
+        self._last_activity: dict[str, Any] = {}  # last tool call info + timestamp
+
     def _build_system_prompt(self) -> str:
         """Build system prompt with current context usage stats."""
         from datetime import date as _date
@@ -276,30 +280,25 @@ class Agent:
 
         return result
 
-    def _check_context_compact(self) -> None:
-        """If context window usage exceeds 75%, dump and compact.
+    def _do_context_dump(self, reason: str = "compaction") -> Path:
+        """Dump current conversation to a file and compact messages.
 
-        Uses the last API call's prompt_tokens as a proxy for current
-        context size (since it includes the full conversation each time).
+        Args:
+            reason: Why the dump happened ("compaction" or "flush").
+
+        Returns:
+            Path to the dump file.
         """
         from browser_py.agent.sessions import get_context_limit
 
         model = get_model()
         context_limit = get_context_limit(model)
-        threshold = int(context_limit * 0.75)
 
-        # _last_prompt_tokens tracks the most recent call's prompt size,
-        # which represents the actual current context window usage.
-        if self._last_prompt_tokens < threshold:
-            return
-
-        # Dump raw context to workspace
-        import time as _time
-        dump_path = self.workspace / "context_dumps" / f"dump_{int(_time.time())}.md"
+        dump_path = self.workspace / "context_dumps" / f"dump_{int(time.time())}.md"
         dump_path.parent.mkdir(parents=True, exist_ok=True)
 
         dump_lines = [
-            f"# Context Dump — {_time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"# Context Dump — {time.strftime('%Y-%m-%d %H:%M:%S')} ({reason})",
             f"Model: {model} | Tokens: {self.total_tokens:,} / {context_limit:,}",
             f"Messages: {len(self.messages)}\n",
         ]
@@ -323,7 +322,7 @@ class Agent:
 
         dump_path.write_text("\n".join(dump_lines))
 
-        # Build summary by extracting key information from messages
+        # Build summary
         summary_parts = ["## Conversation Summary (context compacted)\n"]
         for msg in self.messages:
             role = msg.get("role", "?")
@@ -333,11 +332,9 @@ class Agent:
             elif role == "assistant" and content:
                 summary_parts.append(f"**Assistant:** {content[:1000]}")
             elif role == "tool":
-                # Keep just the tool call id for reference
                 summary_parts.append(f"*[tool result: {len(content or '')} chars]*")
 
         summary = "\n".join(summary_parts)
-        # Cap summary size
         if len(summary) > 8000:
             summary = summary[:8000] + "\n\n*[summary truncated]*"
 
@@ -345,7 +342,7 @@ class Agent:
         dump_rel = dump_path.relative_to(self.workspace)
         self.messages.clear()
 
-        # Reset token counts (the summary is much smaller)
+        # Reset token counts
         self._last_prompt_tokens = 0
         self.prompt_tokens = 0
         self.completion_tokens = 0
@@ -366,6 +363,21 @@ class Agent:
                 "Continue from where we left off."
             ),
         })
+
+        return dump_path
+
+    def _check_context_compact(self) -> None:
+        """If context window usage exceeds 75%, dump and compact."""
+        from browser_py.agent.sessions import get_context_limit
+
+        model = get_model()
+        context_limit = get_context_limit(model)
+        threshold = int(context_limit * 0.75)
+
+        if self._last_prompt_tokens < threshold:
+            return
+
+        self._do_context_dump("compaction")
 
     def chat(self, user_message: str) -> str:
         """Send a message and get a response. Handles multi-step tool loops.
@@ -389,10 +401,20 @@ class Agent:
             pass
 
         iteration = 0
+        self._abort = False
+        self._last_activity = {"state": "starting", "time": time.time()}
         while True:
             iteration += 1
 
+            # Check abort flag (set by flush())
+            if self._abort:
+                self._abort = False
+                self._do_context_dump("flush")
+                self._last_activity = {"state": "flushed", "time": time.time()}
+                return "(Flushed — context saved to context_dumps/. Use grep to recover details.)"
+
             # Check if context needs compacting before calling LLM
+            self._last_activity = {"state": "calling_llm", "iteration": iteration, "time": time.time()}
             self._check_context_compact()
             response = self._call_llm()
             choice = response.choices[0]
@@ -457,11 +479,21 @@ class Agent:
 
             # Execute each tool call
             for tc in msg.tool_calls:
+                if self._abort:
+                    break
+
                 try:
                     args = json.loads(tc.function.arguments)
                 except json.JSONDecodeError:
                     args = {}
 
+                self._last_activity = {
+                    "state": "tool_call",
+                    "tool": tc.function.name,
+                    "params": args,
+                    "iteration": iteration,
+                    "time": time.time(),
+                }
                 result = self._execute_tool(tc.function.name, args)
 
                 # Add tool result to history
@@ -524,6 +556,25 @@ class Agent:
         text = re.sub(r'```(?:json)?\s*\{[^`]*?"name"[^`]*?\}\s*```', '', text, flags=re.DOTALL)
         return text.strip()
 
+    def probe(self) -> dict[str, Any]:
+        """Return the agent's current activity state (for UI probe button)."""
+        activity = dict(self._last_activity)
+        if activity.get("time"):
+            activity["elapsed_seconds"] = round(time.time() - activity["time"], 1)
+        activity["message_count"] = len(self.messages)
+        activity["token_usage"] = self.get_token_usage()
+        return activity
+
+    def flush(self) -> str:
+        """Abort the running loop, dump context, return summary.
+
+        Safe to call from another thread while chat() is running.
+        """
+        self._abort = True
+        # The actual dump happens when the loop sees _abort on next iteration.
+        # Return immediately — the loop will produce the dump and exit.
+        return "Flush requested — agent will stop after current step."
+
     def reset(self) -> None:
         """Clear conversation history and token counts, clean up browser."""
         try:
@@ -535,6 +586,8 @@ class Agent:
         self.prompt_tokens = 0
         self.completion_tokens = 0
         self.session_id = None
+        self._abort = False
+        self._last_activity = {}
 
     def get_history(self) -> list[dict[str, Any]]:
         """Get conversation history."""

@@ -230,6 +230,27 @@ async def export_session_api(session_id: str) -> JSONResponse:
     return JSONResponse({"error": "Session not found"}, status_code=404)
 
 
+@app.get("/api/probe")
+async def probe_agent() -> JSONResponse:
+    """Probe the agent's current activity state."""
+    try:
+        agent = _get_agent()
+        return JSONResponse(agent.probe())
+    except RuntimeError:
+        return JSONResponse({"state": "idle"})
+
+
+@app.post("/api/flush")
+async def flush_agent() -> JSONResponse:
+    """Abort the running agent loop and dump context."""
+    try:
+        agent = _get_agent()
+        msg = agent.flush()
+        return JSONResponse({"ok": True, "message": msg})
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
 @app.get("/api/tokens")
 async def get_tokens() -> JSONResponse:
     """Get current token usage for the active session."""
@@ -1209,7 +1230,9 @@ _FALLBACK_HTML = """\
   <div class="page" id="page-chat">
     <header>
       <h2>Chat</h2>
-      <button class="btn secondary" onclick="resetChat()" style="margin-left:auto">New Chat</button>
+      <button class="btn secondary" onclick="probeAgent()" id="probe-btn" style="margin-left:auto;font-size:12px;padding:6px 10px" title="Check what the agent is doing right now">🔍 Probe</button>
+      <button class="btn danger" onclick="flushAgent()" id="flush-btn" style="font-size:12px;padding:6px 10px" title="Stop the agent and dump context">⏹ Flush</button>
+      <button class="btn secondary" onclick="resetChat()" style="font-size:12px;padding:6px 10px">New Chat</button>
       <div class="status" id="status">Connecting...</div>
     </header>
     <div class="context-warning" id="context-warning">
@@ -2143,6 +2166,30 @@ function send() {
   inputEl.value = '';
   inputEl.style.height = 'auto';
   sendBtn.disabled = true;
+}
+
+async function probeAgent() {
+  try {
+    const res = await fetch('/api/probe');
+    const data = await res.json();
+    let text = '🔍 Agent status: ' + (data.state || 'idle');
+    if (data.tool) text += ' — ' + data.tool + '(' + JSON.stringify(data.params || {}).slice(0, 100) + ')';
+    if (data.iteration) text += ' [iteration ' + data.iteration + ']';
+    if (data.elapsed_seconds) text += ' (' + data.elapsed_seconds + 's ago)';
+    if (data.token_usage) text += '\\nTokens: ' + (data.token_usage.total_tokens || 0).toLocaleString() +
+      ' / ' + (data.token_usage.context_limit || 0).toLocaleString() +
+      ' (' + (data.token_usage.usage_percent || 0) + '%)';
+    addMsg(text, 'tool');
+  } catch(e) { addMsg('Probe failed: ' + e, 'tool'); }
+}
+
+async function flushAgent() {
+  if (!confirm('Stop the agent and dump context? The current task will be aborted.')) return;
+  try {
+    const res = await fetch('/api/flush', { method: 'POST' });
+    const data = await res.json();
+    addMsg('⏹ ' + (data.message || 'Flush requested'), 'tool');
+  } catch(e) { addMsg('Flush failed: ' + e, 'tool'); }
 }
 
 async function resetChat() {
