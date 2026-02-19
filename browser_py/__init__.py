@@ -16,5 +16,5 @@ Quick start:
 
 from browser_py.core import Browser, CDPSession
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = ["Browser", "CDPSession"]

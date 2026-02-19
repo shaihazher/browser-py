@@ -256,7 +256,15 @@ def print_main_help() -> None:
     # Group commands
     groups = [
         (
-            "Setup",
+            "Agent",
+            [
+                ("setup", "Configure LLM provider, workspace, browser"),
+                ("agent [message]", "Chat with the agent (interactive or one-shot)"),
+                ("serve [--port 8321]", "Start the web UI"),
+            ],
+        ),
+        (
+            "Browser",
             [
                 ("launch [name]", "Start Chrome (default or named profile)"),
                 ("launch new [name]", "Create a new profile"),
@@ -640,6 +648,100 @@ def run_command(browser: Browser, cmd: str, args: list[str]) -> str | None:
         sys.exit(1)
 
 
+def run_agent(args: list[str]) -> None:
+    """Run the agent with a one-shot message or interactive mode."""
+    from browser_py.agent.config import is_configured
+
+    if not is_configured():
+        print(_yellow("Agent not configured. Running setup first...\n"))
+        from browser_py.agent.setup import run_setup
+        run_setup()
+        return
+
+    if not args:
+        # Interactive mode
+        from browser_py.agent.loop import Agent
+        from browser_py.agent.config import get_agent_config
+
+        cfg = get_agent_config()
+        agent = Agent(
+            browser_profile=cfg.get("browser_profile"),
+            on_tool_call=lambda name, params, result: print(
+                _dim(f"  🔧 {name} → {params.get('action', '')}") +
+                (f"\n{_dim('     ' + result[:200])}" if result else "")
+            ),
+        )
+        if not cfg.get("shell_enabled", True):
+            agent._shell.enabled = False
+
+        print(_bold("browser-py agent") + _dim(" (type 'quit' to exit, 'reset' to clear)\n"))
+
+        while True:
+            try:
+                user_input = input(_cyan("You: ")).strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if not user_input:
+                continue
+            if user_input.lower() in ("quit", "exit", "q"):
+                break
+            if user_input.lower() == "reset":
+                agent.reset()
+                print(_dim("Chat cleared.\n"))
+                continue
+
+            print()
+            response = agent.chat(user_input)
+            print(f"\n{_green('Agent:')} {response}\n")
+    else:
+        # One-shot mode
+        message = " ".join(args)
+        from browser_py.agent.loop import Agent
+        from browser_py.agent.config import get_agent_config
+
+        cfg = get_agent_config()
+        agent = Agent(
+            browser_profile=cfg.get("browser_profile"),
+            on_tool_call=lambda name, params, result: print(
+                _dim(f"  🔧 {name} → {params.get('action', '')}"),
+            ),
+        )
+        if not cfg.get("shell_enabled", True):
+            agent._shell.enabled = False
+
+        response = agent.chat(message)
+        print(response)
+
+
+def run_serve(args: list[str]) -> None:
+    """Start the web UI server."""
+    from browser_py.agent.config import is_configured
+
+    if not is_configured():
+        print(_yellow("Agent not configured. Running setup first...\n"))
+        from browser_py.agent.setup import run_setup
+        run_setup()
+        return
+
+    host = "127.0.0.1"
+    port = 8321
+
+    i = 0
+    while i < len(args):
+        if args[i] in ("--port", "-p") and i + 1 < len(args):
+            port = int(args[i + 1])
+            i += 2
+        elif args[i] in ("--host",) and i + 1 < len(args):
+            host = args[i + 1]
+            i += 2
+        else:
+            i += 1
+
+    from browser_py.server.app import start_server
+    start_server(host=host, port=port)
+
+
 def main() -> None:
     """CLI entry point."""
     args = sys.argv[1:]
@@ -664,6 +766,20 @@ def main() -> None:
         return
 
     try:
+        # Agent commands
+        if cmd == "setup":
+            from browser_py.agent.setup import run_setup
+            run_setup()
+            return
+
+        if cmd == "agent":
+            run_agent(cmd_args)
+            return
+
+        if cmd == "serve":
+            run_serve(cmd_args)
+            return
+
         # Launch doesn't need an existing browser connection
         if cmd == "launch":
             result = run_launch(cmd_args)

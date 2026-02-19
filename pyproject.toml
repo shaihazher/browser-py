@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "browser-py"
-version = "0.1.0"
-description = "Lightweight CDP browser control for Python. Connect to your existing Chrome sessions."
+version = "0.2.0"
+description = "Lightweight CDP browser control for Python — with an AI agent that can browse, read PDFs, manage files, and automate tasks."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [{ name = "Azeruddin Sheik", email = "shaihazher@gmail.com" }]
-keywords = ["browser", "chrome", "cdp", "automation", "devtools", "websocket"]
+keywords = ["browser", "chrome", "cdp", "automation", "ai", "agent", "llm"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -23,8 +23,20 @@ classifiers = [
     "Topic :: Internet :: WWW/HTTP :: Browsers",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Software Development :: Testing",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = ["websockets>=12.0"]
+
+[project.optional-dependencies]
+agent = [
+    "litellm>=1.40.0",
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.27.0",
+    "apscheduler>=3.10.0",
+    "pymupdf>=1.24.0",
+    "weasyprint>=62.0",
+    "openpyxl>=3.1.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/shaihazher/browser-py"
