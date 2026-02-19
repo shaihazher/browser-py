@@ -70,6 +70,14 @@ That's it: search → click → read → write. Aim for 2-3 sources per query.
 to discover real links before visiting them.
 - Use action="text" to read article content (not elements).
 - Be efficient — finish in under 10 tool calls.
+- You can use files action="grep" to search file contents by keyword.
+
+## Context & Memory
+
+Your context window is {context_limit:,} tokens. If your context fills up, \
+it will be compacted — your conversation is saved to `context_dumps/` and \
+replaced with a summary. Use `files grep` on the dump to recover specifics. \
+Do NOT read the full dump file.
 """
 
 SUB_AGENT_TASK_PROMPT = """\
@@ -154,7 +162,7 @@ class ResearchSession:
         if not cfg.get("shell_enabled", True):
             agent._shell.enabled = False
         if system_prompt:
-            agent._system_prompt = system_prompt
+            agent._custom_system_prompt = system_prompt
         return agent
 
     def plan(self) -> list[dict[str, str]]:
@@ -226,7 +234,9 @@ class ResearchSession:
         )
 
         today = date.today().strftime("%B %d, %Y")
-        system = SUB_AGENT_SYSTEM_PROMPT.format(today=today, workspace=self.workspace)
+        # Only substitute {today} here; {workspace}, {context_*} are filled
+        # dynamically by Agent._build_system_prompt() on each LLM call.
+        system = SUB_AGENT_SYSTEM_PROMPT.replace("{today}", today)
         agent = self._create_agent(system_prompt=system)
         prompt = SUB_AGENT_TASK_PROMPT.format(
             task=subtopic["task"],

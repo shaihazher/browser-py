@@ -38,8 +38,10 @@ can control a web browser to accomplish tasks.
 ## Your Tools
 
 - **browser**: Navigate, click, type, read pages, take screenshots. Use your \
-real browser with saved logins.
-- **files**: Read, write, list, move, copy, delete files in the workspace.
+real browser with saved logins. Use action="search" to Google something.
+- **files**: Read, write, list, move, copy, delete, **grep** files in the workspace. \
+Use action="grep" with a query to search file contents (case-insensitive, \
+returns file:line:content matches).
 - **pdf**: Read text from PDFs, create PDFs from HTML.
 - **spreadsheet**: Read/write CSV and Excel files.
 - **shell**: Run shell commands (working directory = workspace).
@@ -54,6 +56,17 @@ text (read result). Always call 'elements' after navigating to see the page.
 3. **Be persistent**: If elements aren't found, scroll down or wait longer. \
 Web pages load dynamically.
 4. **File paths**: All file paths are relative to the workspace directory.
+
+## Context & Memory
+
+Your context window is {context_limit:,} tokens. You're currently at \
+{context_used:,} tokens ({context_pct}% used).
+
+When your context gets large, it may be **compacted** — your full conversation \
+is saved to `context_dumps/` and replaced with a summary. If that happens, \
+you'll be told where the dump is. Use `files grep` to look up specific details \
+from prior conversation — do NOT read the full dump file (it's too large for \
+your context). Grep for keywords instead.
 
 ## Important
 
@@ -127,7 +140,7 @@ class Agent:
 
         # Conversation history
         self.messages: list[dict[str, Any]] = []
-        self._system_prompt = SYSTEM_PROMPT.format(workspace=self.workspace)
+        self._custom_system_prompt: str | None = None  # set externally for sub-agents
 
         # Token tracking
         self.total_tokens = 0
@@ -137,6 +150,30 @@ class Agent:
         # Session management
         self.session_id: str | None = None
         self._last_prompt_tokens: int = 0  # context size from most recent LLM call
+
+    def _build_system_prompt(self) -> str:
+        """Build system prompt with current context usage stats."""
+        from browser_py.agent.sessions import get_context_limit
+
+        model = get_model()
+        context_limit = get_context_limit(model)
+        context_used = self._last_prompt_tokens
+        context_pct = round(context_used / context_limit * 100) if context_limit else 0
+
+        if self._custom_system_prompt:
+            return self._custom_system_prompt.format(
+                workspace=self.workspace,
+                context_limit=context_limit,
+                context_used=context_used,
+                context_pct=context_pct,
+            )
+
+        return SYSTEM_PROMPT.format(
+            workspace=self.workspace,
+            context_limit=context_limit,
+            context_used=context_used,
+            context_pct=context_pct,
+        )
 
     def _setup_litellm(self) -> None:
         """Configure LiteLLM with the right provider credentials."""
@@ -186,7 +223,7 @@ class Agent:
         model = get_model()
         provider = get_provider()
 
-        messages = [{"role": "system", "content": self._system_prompt}] + self.messages
+        messages = [{"role": "system", "content": self._build_system_prompt()}] + self.messages
 
         kwargs = dict(
             model=model,
@@ -303,23 +340,30 @@ class Agent:
             summary = summary[:8000] + "\n\n*[summary truncated]*"
 
         # Replace messages with compact summary
+        dump_rel = dump_path.relative_to(self.workspace)
         self.messages.clear()
-        self.messages.append({
-            "role": "user",
-            "content": (
-                f"[Context was compacted at {self._last_prompt_tokens:,} prompt tokens "
-                f"({self.total_tokens:,} total used). "
-                f"Raw dump saved to: {dump_path.relative_to(self.workspace)}]\n\n"
-                f"{summary}\n\n"
-                "Continue from where we left off."
-            ),
-        })
 
         # Reset token counts (the summary is much smaller)
         self._last_prompt_tokens = 0
         self.prompt_tokens = 0
         self.completion_tokens = 0
         self.total_tokens = 0
+
+        self.messages.append({
+            "role": "user",
+            "content": (
+                f"[CONTEXT COMPACTED] Your conversation history was too large and has "
+                f"been compacted. The full raw conversation was saved to: `{dump_rel}`\n\n"
+                f"Your context window is {context_limit:,} tokens. After compaction you're "
+                f"near 0% — you have the full window available again.\n\n"
+                f"**To recover details from before compaction:** use `files` with "
+                f'action="grep", query="<keyword>" and path="{dump_rel.parent}" to '
+                f"search for specific information. Do NOT read the full dump file — "
+                f"it's too large. Grep for what you need.\n\n"
+                f"{summary}\n\n"
+                "Continue from where we left off."
+            ),
+        })
 
     def chat(self, user_message: str) -> str:
         """Send a message and get a response. Handles multi-step tool loops.
