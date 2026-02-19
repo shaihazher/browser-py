@@ -223,12 +223,18 @@ def _call_llm_simple(prompt: str, system: str = "", max_tokens: int = 4096) -> s
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
+    cfg = get_agent_config()
     kwargs = dict(
         model=model,
         messages=messages,
         max_tokens=max_tokens,
-        timeout=get_agent_config().get("timeout", 300),
+        timeout=cfg.get("timeout", 300),
     )
+
+    # Reasoning effort
+    reasoning = cfg.get("reasoning_effort", "medium")
+    if reasoning:
+        kwargs["reasoning_effort"] = reasoning
 
     if provider == "openrouter":
         kwargs["api_key"] = key

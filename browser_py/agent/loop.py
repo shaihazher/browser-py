@@ -263,6 +263,13 @@ class Agent:
             timeout=self._get_timeout(),
         )
 
+        # Reasoning effort — controls how hard the model thinks.
+        # Supported by Anthropic (low/medium/high) and OpenAI.
+        cfg = get_agent_config()
+        reasoning = cfg.get("reasoning_effort", "medium")
+        if reasoning:
+            kwargs["reasoning_effort"] = reasoning
+
         # OpenRouter: use openai-compatible base_url so ALL model IDs work,
         # including meta-routers like openrouter/free, openrouter/auto.
         # LiteLLM's native openrouter/ prefix chokes on those.
