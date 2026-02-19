@@ -241,6 +241,63 @@ b.screenshot("page.png")
 b.upload("~/photos/avatar.jpg")
 ```
 
+### Profile management
+
+```python
+from browser_py import Browser
+from browser_py.profiles import (
+    create_profile,
+    list_profiles,
+    get_profile,
+    set_default,
+    delete_profile,
+)
+
+# Create named profiles
+create_profile("work")          # → {"name": "work", "port": 9222, ...}
+create_profile("personal")     # → {"name": "personal", "port": 9223, ...}
+
+# List all profiles
+for p in list_profiles():
+    print(f"{p['name']} — port {p['port']} {'★' if p['is_default'] else ''}")
+# work — port 9222 ★
+# personal — port 9223
+
+# Set default
+set_default("personal")
+
+# Get a profile's info
+profile = get_profile("work")  # By name
+profile = get_profile()        # Default profile
+
+# Launch a specific profile
+Browser.launch(
+    port=profile["port"],
+    user_data_dir=profile["path"],
+)
+
+# Connect to it
+b = Browser(f"http://127.0.0.1:{profile['port']}")
+b.open("https://github.com")
+
+# Run multiple profiles simultaneously
+work = get_profile("work")
+personal = get_profile("personal")
+
+Browser.launch(port=work["port"], user_data_dir=work["path"])
+Browser.launch(port=personal["port"], user_data_dir=personal["path"])
+
+b_work = Browser(f"http://127.0.0.1:{work['port']}")
+b_personal = Browser(f"http://127.0.0.1:{personal['port']}")
+
+# Each has its own sessions — work GitHub, personal Gmail, etc.
+b_work.open("https://github.com")
+b_personal.open("https://gmail.com")
+
+# Clean up
+delete_profile("old-project")
+```
+
 ### Scoped element queries
 
 ```python
