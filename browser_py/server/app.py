@@ -26,6 +26,7 @@ app = FastAPI(title="browser-py", docs_url=None, redoc_url=None)
 _agent: Agent | None = None
 _agent_lock = threading.Lock()
 _ws_clients: list[WebSocket] = []
+_chat_task: asyncio.Task | None = None  # tracks the running chat task
 
 
 def _on_token_update(usage: dict) -> None:
@@ -242,13 +243,29 @@ async def probe_agent() -> JSONResponse:
 
 @app.post("/api/flush")
 async def flush_agent() -> JSONResponse:
-    """Abort the running agent loop and dump context."""
+    """Abort the running agent loop, dump context, cancel the task."""
+    global _chat_task
     try:
         agent = _get_agent()
-        msg = agent.flush()
-        return JSONResponse({"ok": True, "message": msg})
     except RuntimeError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
+
+    # Set abort flag (in case the loop is between steps)
+    agent._abort = True
+
+    # Dump context immediately from here — don't wait for the loop
+    dump_path = None
+    if agent.messages:
+        loop = asyncio.get_event_loop()
+        dump_path = await loop.run_in_executor(None, agent._do_context_dump, "flush")
+
+    # Cancel the running chat task if any
+    if _chat_task and not _chat_task.done():
+        _chat_task.cancel()
+        _chat_task = None
+
+    dump_name = str(dump_path.name) if dump_path else "no messages to dump"
+    return JSONResponse({"ok": True, "message": f"Flushed — {dump_name}"})
 
 
 @app.get("/api/tokens")
@@ -646,9 +663,15 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                 await ws.send_text(json.dumps({"type": "thinking"}))
 
                 loop = asyncio.get_event_loop()
-                result = await loop.run_in_executor(
-                    None, agent.chat, msg.get("message", "")
+                _chat_task = loop.create_task(
+                    loop.run_in_executor(None, agent.chat, msg.get("message", ""))
                 )
+                try:
+                    result = await _chat_task
+                except asyncio.CancelledError:
+                    result = "(Flushed — context saved to context_dumps/.)"
+                finally:
+                    _chat_task = None
 
                 # Clean up browser tabs opened during this exchange
                 try:
@@ -2189,6 +2212,8 @@ async function flushAgent() {
     const res = await fetch('/api/flush', { method: 'POST' });
     const data = await res.json();
     addMsg('⏹ ' + (data.message || 'Flush requested'), 'tool');
+    sendBtn.disabled = false;
+    inputEl.focus();
   } catch(e) { addMsg('Flush failed: ' + e, 'tool'); }
 }
 
