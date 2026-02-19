@@ -289,6 +289,9 @@ class ResearchSession:
     def compile(self, findings_paths: list[str]) -> str:
         """Compile all sub-agent findings into a final report.
 
+        Single LLM call — no agent loop, no tools. Just reads findings,
+        asks the LLM to compile, writes the result to disk.
+
         Returns the path to the final report.
         """
         self._progress("compiling", "Compiling findings into final report...")
@@ -303,42 +306,64 @@ class ResearchSession:
             findings_text += f"\n### Sub-Agent {i+1} Findings\n\n{content}\n\n---\n"
 
         output_file = f"research/{self.research_dir.name}/final_report.md"
+        report_path = self.workspace / output_file
 
-        agent = self._create_agent()
         prompt = COMPILER_PROMPT.format(
             n=len(findings_paths),
             query=self.query,
-            findings=findings_text[:50000],  # Cap to avoid context overflow
+            findings=findings_text[:50000],
             output_file=output_file,
         )
 
         try:
-            agent.chat(prompt)
+            import litellm
+            from browser_py.agent.config import get_model, get_provider, get_provider_key, PROVIDERS
+            import os
+
+            provider = get_provider()
+            key = get_provider_key(provider)
+            model = get_model()
+
+            # Set env vars for litellm
+            info = PROVIDERS.get(provider, {})
+            if provider == "openrouter":
+                os.environ["OPENROUTER_API_KEY"] = key
+            elif provider in ("anthropic", "claude_max"):
+                os.environ["ANTHROPIC_API_KEY"] = key
+            elif provider == "openai":
+                os.environ["OPENAI_API_KEY"] = key
+
+            kwargs = dict(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "You are a research report compiler. Write comprehensive, well-structured reports in markdown."},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=get_agent_config().get("max_tokens", 8192),
+                timeout=get_agent_config().get("timeout", 300),
+            )
+
+            if provider == "openrouter":
+                kwargs["api_key"] = key
+                kwargs["base_url"] = "https://openrouter.ai/api/v1"
+                kwargs["model"] = f"openai/{model}"
+
+            response = litellm.completion(**kwargs)
+            report_content = response.choices[0].message.content or ""
+
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(report_content)
+
         except Exception as e:
             # Fallback: concatenate findings
-            abs_output = self.workspace / output_file
-            abs_output.write_text(
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(
                 f"# Research Report: {self.query}\n\n"
                 f"*Compilation error: {e}*\n\n"
                 f"## Raw Findings\n\n{findings_text}"
             )
-        finally:
-            try:
-                agent.cleanup_browser()
-            except Exception:
-                pass
 
-        report_path = self.workspace / output_file
         self._progress("complete", f"Report saved to {output_file}")
-
-        if report_path.exists():
-            return str(report_path)
-
-        # Fallback
-        report_path.write_text(
-            f"# Research Report: {self.query}\n\n"
-            f"## Combined Findings\n\n{findings_text}"
-        )
         return str(report_path)
 
     def run(self) -> dict[str, Any]:
