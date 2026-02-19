@@ -1757,7 +1757,10 @@ function renderMd(text) {
   if (!text) return '';
   if (md && md.parse) return md.parse(text);
   // Fallback: escape HTML and preserve newlines
-  return text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');
+  var s = text.split('&').join('&amp;');
+  s = s.split(String.fromCharCode(60)).join('&lt;');
+  s = s.split('>').join('&gt;');
+  return s.split('\\n').join('<br>');
 }
 
 const chatEl = document.getElementById('chat-messages');
@@ -2659,11 +2662,22 @@ function addMsg(text, cls, raw) {
 }
 
 function toggleSubtaskStream(idx) {
-  // idx can be a number or "cron-N" string
-  const prefix = typeof idx === 'string' && idx.startsWith('cron-') ? 'cron-subtask' : 'subtask';
-  const numIdx = typeof idx === 'string' ? idx.replace('cron-', '') : idx;
-  const stream = document.getElementById(prefix + '-stream-' + numIdx);
-  const chev = document.getElementById(prefix + '-chevron-' + numIdx);
+  const stream = document.getElementById('subtask-stream-' + idx);
+  const chev = document.getElementById('subtask-chevron-' + idx);
+  if (!stream) return;
+  const isVisible = stream.classList.contains('visible');
+  if (isVisible) {
+    stream.classList.remove('visible');
+    if (chev) chev.classList.remove('open');
+  } else {
+    stream.classList.add('visible');
+    if (chev) chev.classList.add('open');
+  }
+}
+
+function toggleCronSubtask(idx) {
+  const stream = document.getElementById('cron-subtask-stream-' + idx);
+  const chev = document.getElementById('cron-subtask-chevron-' + idx);
   if (!stream) return;
   const isVisible = stream.classList.contains('visible');
   if (isVisible) {
@@ -2949,7 +2963,7 @@ function replayCronEvent(ev) {
     let html = '<div class="subtask-plan"><strong>📋 ' + ev.subtasks.length + ' steps:</strong><div class="subtask-list">';
     ev.subtasks.forEach((s, i) => {
       html += '<div class="subtask-item" id="cron-subtask-' + i + '">' +
-        '<div class="subtask-header" onclick="toggleSubtaskStream(\'cron-\'+' + i + ')">' +
+        '<div class="subtask-header" onclick="toggleCronSubtask(' + i + ')">' +
         '<span class="chevron" id="cron-subtask-chevron-' + i + '">▶</span>' +
         '<span class="subtask-status">⏳</span> <strong>Step ' + (i+1) + '</strong> (' + s.tool + '): ' + s.task.slice(0, 100) +
         '</div>' +
