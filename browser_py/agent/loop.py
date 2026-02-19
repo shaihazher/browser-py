@@ -164,6 +164,9 @@ class Agent:
         self._abort = False  # set True to stop the loop on next iteration
         self._last_activity: dict[str, Any] = {}  # last tool call info + timestamp
 
+        # Subtask runner reference (for probe to see active sub-agent)
+        self._active_runner: Any = None
+
     def _get_timeout(self) -> int:
         """Get LLM call timeout from config (default 300s)."""
         cfg = get_agent_config()
@@ -499,8 +502,10 @@ class Agent:
             abort_event=abort_event,
             original_task=user_message,
         )
+        self._active_runner = runner
 
         result = runner.run()
+        self._active_runner = None
 
         # Add summary to conversation history
         summary_parts = [f"**Task decomposed into {len(subtasks)} subtasks:**\n"]
@@ -702,12 +707,37 @@ class Agent:
         return text.strip()
 
     def probe(self) -> dict[str, Any]:
-        """Return the agent's current activity state (for UI probe button)."""
+        """Return the agent's current activity state (for UI probe button).
+
+        If a subtask runner is active, probes the active mini-agent for
+        detailed tool-call state instead of just the outer "subtask" status.
+        """
         activity = dict(self._last_activity)
+
+        # If we have an active runner with a sub-agent, get its live state
+        runner = self._active_runner
+        if runner and runner.active_agent:
+            sub_activity = runner.active_agent.probe()
+            # Merge subtask info with sub-agent's live state
+            activity["sub_agent"] = sub_activity
+            # Show the sub-agent's actual state (tool_call, calling_llm, etc.)
+            if sub_activity.get("state") and sub_activity["state"] != "idle":
+                activity["detail_state"] = sub_activity["state"]
+                if sub_activity.get("tool"):
+                    activity["detail_tool"] = sub_activity["tool"]
+                if sub_activity.get("params"):
+                    activity["detail_params"] = sub_activity["params"]
+                if sub_activity.get("elapsed_seconds"):
+                    activity["detail_elapsed"] = sub_activity["elapsed_seconds"]
+            # Use sub-agent's token usage (current context window)
+            if sub_activity.get("token_usage"):
+                activity["token_usage"] = sub_activity["token_usage"]
+
         if activity.get("time"):
             activity["elapsed_seconds"] = round(time.time() - activity["time"], 1)
         activity["message_count"] = len(self.messages)
-        activity["token_usage"] = self.get_token_usage()
+        if "token_usage" not in activity:
+            activity["token_usage"] = self.get_token_usage()
         return activity
 
     def flush(self) -> str:

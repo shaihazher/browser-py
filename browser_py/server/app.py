@@ -245,19 +245,22 @@ async def export_session_api(session_id: str) -> JSONResponse:
 
 @app.get("/api/probe")
 async def probe_agent() -> JSONResponse:
-    """Probe the agent's current activity state (chat or research)."""
-    # Check research sub-agents first (most likely reason to probe)
-    for ra in list(_research_agents):
-        info = ra.probe()
-        if info.get("state") and info["state"] != "idle":
-            info["source"] = "research"
-            return JSONResponse(info)
-
-    # Fall back to global chat agent
+    """Probe the agent's current activity state (chat, subtask, or research)."""
+    # Fall through to global chat agent — its probe() now delegates
+    # to active subtask runner's sub-agent automatically.
     try:
         agent = _get_agent()
         info = agent.probe()
         info["source"] = "chat"
+
+        # Also check research sub-agents (legacy / standalone research)
+        if info.get("state") in (None, "idle", "done"):
+            for ra in list(_research_agents):
+                ra_info = ra.probe()
+                if ra_info.get("state") and ra_info["state"] != "idle":
+                    ra_info["source"] = "research"
+                    return JSONResponse(ra_info)
+
         return JSONResponse(info)
     except RuntimeError:
         return JSONResponse({"state": "idle"})
