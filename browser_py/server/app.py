@@ -1153,6 +1153,29 @@ _FALLBACK_HTML = """\
   .model-search-wrap .model-count {
     font-size: 11px; color: var(--text-dim); margin-top: 4px;
   }
+  /* Subtask decomposition UI */
+  .subtask-plan { padding: 4px 0; }
+  .subtask-list { margin: 8px 0; }
+  .subtask-item {
+    padding: 4px 8px; margin: 2px 0; border-radius: 4px;
+    font-size: 13px; color: var(--text-dim);
+    background: rgba(255,255,255,0.03);
+  }
+  .subtask-item.active {
+    color: var(--text); background: rgba(99,102,241,0.1);
+    border-left: 2px solid var(--accent);
+  }
+  .subtask-item.done { color: var(--text-dim); }
+  .subtask-item small { color: var(--text-dim); font-size: 11px; }
+  .subtask-stream {
+    margin-top: 8px; padding: 8px 10px;
+    background: rgba(0,0,0,0.2); border-radius: 6px;
+    font-size: 13px; line-height: 1.5;
+    max-height: 300px; overflow-y: auto;
+    white-space: pre-wrap; word-break: break-word;
+    display: none; /* shown when content arrives */
+  }
+  .subtask-stream:not(:empty) { display: block; }
 </style>
 </head>
 <body>
@@ -2224,14 +2247,45 @@ function connect() {
       const btn = document.getElementById('research-start');
       btn.disabled = false;
       btn.textContent = 'Start Research';
+    } else if (msg.type === 'plan') {
+      // Subtask decomposition plan
+      removeThinking();
+      let html = '<div class="subtask-plan"><strong>📋 Task decomposed into ' + msg.subtasks.length + ' steps:</strong><div class="subtask-list">';
+      msg.subtasks.forEach((s, i) => {
+        html += '<div class="subtask-item" id="subtask-' + i + '"><span class="subtask-status">⏳</span> <strong>Step ' + (i+1) + '</strong> (' + s.tool + '): ' + s.task.slice(0, 80) + '</div>';
+      });
+      html += '</div><div class="subtask-stream" id="subtask-stream"></div></div>';
+      addMsg(html, 'agent', true);
+    } else if (msg.type === 'subtask_start') {
+      const el = document.getElementById('subtask-' + msg.subtask.index);
+      if (el) { el.querySelector('.subtask-status').textContent = '▶️'; el.classList.add('active'); }
+      // Clear stream area for new subtask
+      const stream = document.getElementById('subtask-stream');
+      if (stream) stream.textContent = '';
+    } else if (msg.type === 'subtask_done') {
+      const el = document.getElementById('subtask-' + msg.subtask.index);
+      if (el) {
+        el.querySelector('.subtask-status').textContent = '✅';
+        el.classList.remove('active');
+        el.classList.add('done');
+        el.innerHTML += ' <small>(' + msg.subtask.duration + 's)</small>';
+      }
+    } else if (msg.type === 'stream_chunk') {
+      const stream = document.getElementById('subtask-stream');
+      if (stream) {
+        stream.textContent += msg.chunk;
+        stream.scrollTop = stream.scrollHeight;
+      }
     }
   };
 }
 
-function addMsg(text, cls) {
+function addMsg(text, cls, raw) {
   const div = document.createElement('div');
   div.className = 'msg ' + cls;
-  if (cls === 'tool') {
+  if (raw) {
+    div.innerHTML = text;
+  } else if (cls === 'tool') {
     const parts = text.split('\\n');
     const nameSpan = document.createElement('span');
     nameSpan.className = 'tool-name';
