@@ -162,6 +162,7 @@ async def config() -> JSONResponse:
         "workspace": cfg.get("workspace"),
         "browser_profile": cfg.get("browser_profile"),
         "shell_enabled": cfg.get("shell_enabled", True),
+        "decompose_enabled": cfg.get("decompose_enabled", True),
         "timeout": cfg.get("timeout", 300),
         "main_max_tokens": cfg.get("main_max_tokens", cfg.get("max_tokens", 8192)),
         "subagent_max_tokens": cfg.get("subagent_max_tokens", cfg.get("max_tokens", 4096)),
@@ -598,13 +599,22 @@ async def update_config(body: dict) -> JSONResponse:
     config = load_config()
     agent_cfg = config.get("agent", {})
 
-    allowed = {"model", "shell_enabled", "browser_profile", "timeout", "main_max_tokens", "subagent_max_tokens"}
+    allowed = {"model", "shell_enabled", "browser_profile", "decompose_enabled",
+               "timeout", "main_max_tokens", "subagent_max_tokens"}
     for key in allowed:
         if key in body:
             agent_cfg[key] = body[key]
 
     config["agent"] = agent_cfg
     save_config(config)
+
+    # Live-update the running agent if applicable
+    if _agent:
+        if "browser_profile" in body:
+            _agent._browser._default_profile = body["browser_profile"]
+        if "decompose_enabled" in body:
+            _agent._decompose_enabled = body["decompose_enabled"]
+
     return JSONResponse({"ok": True})
 
 
@@ -739,6 +749,8 @@ async def run_setup(body: dict) -> JSONResponse:
         agent_cfg["workspace"] = str(ws)
 
     agent_cfg["shell_enabled"] = shell_enabled
+    if "decompose_enabled" in body:
+        agent_cfg["decompose_enabled"] = body["decompose_enabled"]
     if body.get("timeout") is not None:
         agent_cfg["timeout"] = int(body["timeout"])
     if body.get("main_max_tokens") is not None:
@@ -1233,19 +1245,6 @@ _FALLBACK_HTML = """\
   .key-status.configured { color: var(--success); }
   .key-status.missing { color: var(--text-dim); }
 
-  /* Research panel */
-  .research-panel { background: var(--surface); border: 1px solid var(--border);
-    border-radius: 10px; padding: 16px; margin: 12px 20px; }
-  .research-panel h3 { font-size: 14px; margin-bottom: 8px; }
-  .research-panel .progress-steps { margin: 12px 0; }
-  .research-panel .step { padding: 6px 0; font-size: 13px; color: var(--text-dim);
-    display: flex; align-items: center; gap: 8px; }
-  .research-panel .step.active { color: var(--accent); }
-  .research-panel .step.done { color: var(--success); }
-  .research-report { background: var(--bg); border: 1px solid var(--border);
-    border-radius: 8px; padding: 16px; margin-top: 12px; max-height: 60vh;
-    overflow-y: auto; font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
-
   /* Setup wizard steps */
   .wizard-steps { display: flex; gap: 4px; margin-bottom: 20px; }
   .wizard-step { flex: 1; height: 4px; border-radius: 2px; background: var(--border); }
@@ -1406,7 +1405,6 @@ _FALLBACK_HTML = """\
   <div class="logo">🌐 browser-py</div>
   <nav>
     <a class="active" data-page="chat" onclick="showPage('chat')">💬 Chat</a>
-    <a data-page="research" onclick="showPage('research')">🔬 Research</a>
     <a data-page="profiles" onclick="showPage('profiles')">🌍 Browser Profiles</a>
     <a data-page="jobs" onclick="showPage('jobs')">⏰ Scheduled Jobs</a>
     <a data-page="settings" onclick="showPage('settings')">⚙️ Settings</a>
@@ -1415,6 +1413,7 @@ _FALLBACK_HTML = """\
       <div id="sessions-list"></div>
     </div>
   </nav>
+  <button class="btn" onclick="launchActiveBrowser()" id="launch-browser-btn" style="margin:8px 12px;width:calc(100% - 24px);font-size:12px;padding:8px">🌍 Open Browser</button>
   <div class="token-bar-wrap" id="token-bar-wrap" style="display:none">
     <div class="token-bar"><div class="fill ok" id="token-fill" style="width:0%"></div></div>
     <div class="token-bar-label">
@@ -1545,7 +1544,12 @@ _FALLBACK_HTML = """\
   <div class="page" id="page-chat">
     <header>
       <h2>Chat</h2>
-      <button class="btn secondary" onclick="probeAgent()" id="probe-btn" style="margin-left:auto;font-size:12px;padding:6px 10px" title="Check what the agent is doing right now">🔍 Probe</button>
+      <select id="profile-switcher" onchange="switchProfile()" title="Active browser profile" style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:4px 8px;color:var(--text);font-size:12px;margin-left:auto;cursor:pointer"></select>
+      <label style="display:flex;align-items:center;gap:4px;font-size:11px;color:var(--text-dim);cursor:pointer;white-space:nowrap" title="When ON, complex tasks are broken into subtasks. When OFF, everything runs in a single loop.">
+        <input type="checkbox" id="decompose-toggle" checked onchange="toggleDecompose()" style="width:auto;margin:0">
+        Decompose
+      </label>
+      <button class="btn secondary" onclick="probeAgent()" id="probe-btn" style="font-size:12px;padding:6px 10px" title="Check what the agent is doing right now">🔍 Probe</button>
       <button class="btn danger" onclick="flushAgent()" id="flush-btn" style="font-size:12px;padding:6px 10px" title="Stop the agent and dump context">⏹ Flush</button>
       <button class="btn secondary" onclick="resetChat()" style="font-size:12px;padding:6px 10px">New Chat</button>
       <div class="status" id="status">Connecting...</div>
@@ -1559,43 +1563,6 @@ _FALLBACK_HTML = """\
       <textarea id="input" placeholder="What should I do?" rows="1"
         onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}"></textarea>
       <button id="send" onclick="send()">Send</button>
-    </div>
-  </div>
-
-  <!-- Research Page -->
-  <div class="page" id="page-research">
-    <header>
-      <h2>🔬 Deep Research</h2>
-      <button class="btn secondary" onclick="probeAgent()" style="margin-left:auto;font-size:12px;padding:6px 10px" title="Check what the agent is doing right now">🔍 Probe</button>
-      <button class="btn danger" onclick="flushAgent()" style="font-size:12px;padding:6px 10px" title="Stop the agent and dump context">⏹ Flush</button>
-    </header>
-    <div class="page-content">
-      <div class="card">
-        <h3>Research Query</h3>
-        <p>Enter a topic and the agent will deploy 5 sub-agents to research it from multiple angles, then compile a comprehensive report.</p>
-        <div class="field">
-          <label>What should I research?</label>
-          <textarea id="research-query" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-size:13px;width:100%;min-height:60px;resize:vertical;font-family:inherit" placeholder="e.g., What are the best strategies for SEO in 2025?"></textarea>
-        </div>
-        <div style="display:flex;gap:8px;align-items:center">
-          <button class="btn" onclick="startResearch()" id="research-start">Start Research</button>
-          <span style="font-size:12px;color:var(--text-dim)">Uses 5 sequential sub-agents with browser access</span>
-        </div>
-      </div>
-      <div id="research-progress" style="display:none">
-        <div class="card">
-          <h3>Research Progress</h3>
-          <div class="progress-steps" id="research-steps"></div>
-          <div id="research-probe" style="display:none;margin-top:8px;padding:8px 12px;background:var(--bg);border-radius:6px;font-size:12px;color:var(--text-dim);font-family:'SF Mono',Monaco,monospace;white-space:pre-wrap"></div>
-        </div>
-      </div>
-      <div id="research-result" style="display:none">
-        <div class="card">
-          <h3>Research Report</h3>
-          <div style="font-size:12px;color:var(--text-dim);margin-bottom:8px" id="research-meta"></div>
-          <div class="research-report" id="research-report-content"></div>
-        </div>
-      </div>
     </div>
   </div>
 
@@ -1700,6 +1667,11 @@ _FALLBACK_HTML = """\
         <div class="field" style="display:flex;align-items:center;gap:8px">
           <input type="checkbox" id="cfg-shell" style="width:auto">
           <label for="cfg-shell" style="margin:0;text-transform:none">Allow shell commands</label>
+        </div>
+        <div class="field" style="display:flex;align-items:center;gap:8px">
+          <input type="checkbox" id="cfg-decompose" style="width:auto" checked>
+          <label for="cfg-decompose" style="margin:0;text-transform:none">Enable task decomposition</label>
+          <span style="font-size:11px;color:var(--text-dim)">(breaks complex tasks into subtasks)</span>
         </div>
         <div class="field">
           <label>Browser Profile</label>
@@ -2064,6 +2036,10 @@ async function init() {
     connect();
     loadVersionInfo(currentCfg);
     loadSessions();
+    loadProfileSwitcher();
+    // Sync decompose toggle with config
+    const dt = document.getElementById('decompose-toggle');
+    if (dt) dt.checked = currentCfg.decompose_enabled !== false;
   }
 }
 
@@ -2206,33 +2182,6 @@ async function reloadSetupModels(provider) {
 }
 
 // ── Research ──
-async function startResearch() {
-  const query = document.getElementById('research-query').value.trim();
-  if (!query) return;
-
-  const btn = document.getElementById('research-start');
-  btn.disabled = true;
-  btn.textContent = 'Researching...';
-
-  document.getElementById('research-progress').style.display = 'block';
-  document.getElementById('research-result').style.display = 'none';
-  document.getElementById('research-steps').innerHTML =
-    '<div class="step active">⏳ Starting research pipeline...</div>';
-
-  try {
-    await fetch('/api/research', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ query })
-    });
-    // Results come via WebSocket
-  } catch(e) {
-    document.getElementById('research-steps').innerHTML +=
-      `<div class="step" style="color:var(--danger)">❌ Error: ${e}</div>`;
-    btn.disabled = false;
-    btn.textContent = 'Start Research';
-  }
-}
-
 // ── Navigation ──
 function showPage(name) {
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
@@ -2244,7 +2193,7 @@ function showPage(name) {
   if (name === 'jobs') loadJobs();
   if (name === 'settings') loadSettingsPage();
   if (name === 'setup') initSetupPage();
-  if (name === 'chat') loadSessions();
+  if (name === 'chat') { loadSessions(); loadProfileSwitcher(); }
   // cron-run page is opened via openCronRun(), not showPage
 }
 
@@ -2519,36 +2468,6 @@ function connect() {
       document.getElementById('token-bar-wrap').style.display = 'none';
       document.getElementById('context-warning').style.display = 'none';
       loadSessions();
-    } else if (msg.type === 'research_progress') {
-      const steps = document.getElementById('research-steps');
-      // Mark previous steps as done
-      steps.querySelectorAll('.step.active').forEach(s => {
-        s.classList.remove('active');
-        s.classList.add('done');
-        s.innerHTML = s.innerHTML.replace('⏳', '✅');
-      });
-      steps.innerHTML += `<div class="step active">⏳ ${msg.message}</div>`;
-    } else if (msg.type === 'research_complete') {
-      const steps = document.getElementById('research-steps');
-      steps.querySelectorAll('.step.active').forEach(s => {
-        s.classList.remove('active');
-        s.classList.add('done');
-        s.innerHTML = s.innerHTML.replace('⏳', '✅');
-      });
-      steps.innerHTML += '<div class="step done">✅ Research complete!</div>';
-      document.getElementById('research-result').style.display = 'block';
-      document.getElementById('research-meta').textContent =
-        `Completed in ${Math.round(msg.duration)}s · ${(msg.subtopics||[]).length} subtopics researched`;
-      document.getElementById('research-report-content').textContent = msg.report || '';
-      const btn = document.getElementById('research-start');
-      btn.disabled = false;
-      btn.textContent = 'Start Research';
-    } else if (msg.type === 'research_error') {
-      const steps = document.getElementById('research-steps');
-      steps.innerHTML += `<div class="step" style="color:var(--danger)">❌ Error: ${msg.error}</div>`;
-      const btn = document.getElementById('research-start');
-      btn.disabled = false;
-      btn.textContent = 'Start Research';
     } else if (msg.type === 'plan') {
       // Subtask decomposition plan — each step gets its own stream area
       removeThinking();
@@ -2716,14 +2635,7 @@ function _probeText(data) {
 }
 
 function _showOnActivePage(text, cls) {
-  const researchPage = document.getElementById('page-research');
-  if (researchPage.classList.contains('active')) {
-    const el = document.getElementById('research-probe');
-    el.style.display = 'block';
-    el.textContent = text;
-  } else {
-    addMsg(text, cls || 'tool');
-  }
+  addMsg(text, cls || 'tool');
 }
 
 async function probeAgent() {
@@ -2742,9 +2654,6 @@ async function flushAgent() {
     const text = '⏹ ' + (data.message || 'Flush requested');
     _showOnActivePage(text, 'tool');
     sendBtn.disabled = false;
-    // Re-enable research button
-    const rbtn = document.getElementById('research-start');
-    if (rbtn) { rbtn.disabled = false; rbtn.textContent = 'Start Research'; }
   } catch(e) { _showOnActivePage('Flush failed: ' + e, 'tool'); }
 }
 
@@ -3007,6 +2916,62 @@ async function probeCronRun() {
   } catch(e) { addCronMsg('Probe failed: ' + e, 'tool'); }
 }
 
+// ── Profile Switcher & Controls ──
+
+async function loadProfileSwitcher() {
+  try {
+    const res = await fetch('/api/profiles/status');
+    const data = await res.json();
+    const sel = document.getElementById('profile-switcher');
+    if (!sel) return;
+    const profiles = data.profiles || [];
+    const active = currentCfg.browser_profile || 'default';
+    sel.innerHTML = profiles.map(p => {
+      const running = p.running ? ' ●' : '';
+      return '<option value="' + p.name + '"' + (p.name === active ? ' selected' : '') + '>' + p.name + running + '</option>';
+    }).join('');
+  } catch(e) {}
+}
+
+async function switchProfile() {
+  const sel = document.getElementById('profile-switcher');
+  const profile = sel.value;
+  await fetch('/api/config', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ browser_profile: profile }),
+  });
+  currentCfg.browser_profile = profile;
+}
+
+async function toggleDecompose() {
+  const enabled = document.getElementById('decompose-toggle').checked;
+  await fetch('/api/config', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ decompose_enabled: enabled }),
+  });
+  currentCfg.decompose_enabled = enabled;
+}
+
+async function launchActiveBrowser() {
+  const profile = currentCfg.browser_profile || 'default';
+  const btn = document.getElementById('launch-browser-btn');
+  btn.disabled = true;
+  btn.textContent = '🌍 Opening...';
+  try {
+    const res = await fetch('/api/profiles/launch', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ name: profile }),
+    });
+    const data = await res.json();
+    if (data.error) { alert(data.error); return; }
+    btn.textContent = '🌍 ' + profile + ' (' + (data.status === 'already_running' ? 'running' : 'launched') + ')';
+    loadProfileSwitcher();  // refresh running status
+  } catch(e) { alert('Failed: ' + e); }
+  finally {
+    setTimeout(() => { btn.disabled = false; btn.textContent = '🌍 Open Browser'; }, 3000);
+  }
+}
+
 // ── Settings Page ──
 let cfgModelPicker;
 async function loadSettingsPage() {
@@ -3042,6 +3007,7 @@ async function loadSettingsPage() {
   document.getElementById('cfg-workspace').value = cfg.workspace || '';
   // Shell
   document.getElementById('cfg-shell').checked = cfg.shell_enabled !== false;
+  document.getElementById('cfg-decompose').checked = cfg.decompose_enabled !== false;
   document.getElementById('cfg-timeout').value = cfg.timeout || 300;
   document.getElementById('cfg-main-max-tokens').value = cfg.main_max_tokens || 8192;
   document.getElementById('cfg-subagent-max-tokens').value = cfg.subagent_max_tokens || 4096;
@@ -3097,12 +3063,13 @@ async function saveSettings() {
   const model = modelCustom || cfgModelPicker.getValue();
   const workspace = document.getElementById('cfg-workspace').value.trim();
   const shell_enabled = document.getElementById('cfg-shell').checked;
+  const decompose_enabled = document.getElementById('cfg-decompose').checked;
   const browser_profile = document.getElementById('cfg-profile').value;
   const timeout = parseInt(document.getElementById('cfg-timeout').value) || 300;
   const main_max_tokens = parseInt(document.getElementById('cfg-main-max-tokens').value) || 8192;
   const subagent_max_tokens = parseInt(document.getElementById('cfg-subagent-max-tokens').value) || 4096;
 
-  const body = { provider, model, workspace, browser_profile, shell_enabled, timeout, main_max_tokens, subagent_max_tokens };
+  const body = { provider, model, workspace, browser_profile, shell_enabled, decompose_enabled, timeout, main_max_tokens, subagent_max_tokens };
 
   // Collect credentials
   if (info.fields) {

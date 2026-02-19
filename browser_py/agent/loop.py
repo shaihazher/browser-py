@@ -120,6 +120,10 @@ class Agent:
         self.on_token_update = on_token_update
         self.on_subtask_progress = on_subtask_progress
 
+        # Decomposition toggle — read from config, can be overridden at runtime
+        cfg = get_agent_config()
+        self._decompose_enabled = cfg.get("decompose_enabled", True)
+
         # Initialize tools — browser downloads go to workspace/downloads
         downloads_dir = str(self.workspace / "downloads")
         self._browser = BrowserTool(default_profile=browser_profile, download_dir=downloads_dir)
@@ -519,6 +523,10 @@ class Agent:
         # If this agent has a custom system prompt, it's a sub-agent —
         # skip decomposition and go straight to the direct loop.
         if self._custom_system_prompt:
+            return self._chat_direct(user_message)
+
+        # If decomposition is disabled, go direct
+        if not self._decompose_enabled:
             return self._chat_direct(user_message)
 
         # Try to decompose the task
