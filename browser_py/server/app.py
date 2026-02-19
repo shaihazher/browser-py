@@ -167,6 +167,70 @@ async def create_browser_profile(body: dict) -> JSONResponse:
         return JSONResponse({"error": str(e)}, status_code=400)
 
 
+@app.post("/api/profiles/launch")
+async def launch_browser_profile(body: dict) -> JSONResponse:
+    """Launch a browser profile."""
+    import json as _json
+    from urllib.request import urlopen
+    from urllib.error import URLError
+    from browser_py.profiles import get_profile
+    from browser_py.core import Browser
+
+    name = body.get("name")
+    try:
+        profile = get_profile(name)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    port = profile["port"]
+
+    # Check if already running
+    try:
+        _json.loads(urlopen(f"http://127.0.0.1:{port}/json/version", timeout=2).read())
+        return JSONResponse({
+            "status": "already_running",
+            "profile": profile["name"],
+            "port": port,
+        })
+    except (URLError, OSError):
+        pass
+
+    # Launch it
+    try:
+        download_dir = str(get_workspace() / "downloads")
+        Browser.launch(
+            port=port,
+            user_data_dir=profile["path"],
+            download_dir=download_dir,
+        )
+        return JSONResponse({
+            "status": "launched",
+            "profile": profile["name"],
+            "port": port,
+        })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/profiles/status")
+async def profile_status() -> JSONResponse:
+    """Check which profiles have a running browser."""
+    import json as _json
+    from urllib.request import urlopen
+    from urllib.error import URLError
+    from browser_py.profiles import list_profiles
+
+    profiles = list_profiles()
+    for p in profiles:
+        try:
+            _json.loads(urlopen(f"http://127.0.0.1:{p['port']}/json/version", timeout=1).read())
+            p["running"] = True
+        except (URLError, OSError):
+            p["running"] = False
+
+    return JSONResponse({"profiles": profiles})
+
+
 @app.post("/api/config")
 async def update_config(body: dict) -> JSONResponse:
     """Update agent configuration."""
@@ -682,17 +746,36 @@ input.addEventListener('input', function() {
 
 // ── Profiles ──
 async function loadProfiles() {
-  const res = await fetch('/api/profiles');
+  const res = await fetch('/api/profiles/status');
   const data = await res.json();
   const el = document.getElementById('profiles-list');
-  if (!data.profiles?.length) { el.innerHTML = '<div class="empty">No profiles yet</div>'; return; }
+  if (!data.profiles?.length) { el.innerHTML = '<div class="empty">No profiles yet. Create one below.</div>'; return; }
   el.innerHTML = data.profiles.map(p => `
     <div class="list-item">
       <span class="name">${p.name}</span>
       <span class="meta">port ${p.port}</span>
       ${p.is_default ? '<span class="badge active">default</span>' : ''}
+      ${p.running
+        ? '<span class="badge active">running</span>'
+        : `<button class="btn" style="padding:4px 12px;font-size:12px" onclick="launchProfile('${p.name}')">Launch</button>`
+      }
     </div>
   `).join('');
+}
+
+async function launchProfile(name) {
+  const btn = event.target;
+  btn.disabled = true;
+  btn.textContent = 'Starting...';
+  try {
+    const res = await fetch('/api/profiles/launch', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ name })
+    });
+    const data = await res.json();
+    if (data.error) { alert(data.error); return; }
+    loadProfiles();
+  } catch(e) { alert('Failed to launch: ' + e); }
 }
 
 async function createProfile() {
