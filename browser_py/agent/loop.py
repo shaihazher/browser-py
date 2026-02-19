@@ -172,16 +172,30 @@ class Agent:
 
         self._setup_litellm()
         model = get_model()
+        provider = get_provider()
 
         messages = [{"role": "system", "content": self._system_prompt}] + self.messages
 
-        response = litellm.completion(
+        kwargs = dict(
             model=model,
             messages=messages,
             tools=self._tool_schemas,
             tool_choice="auto",
             max_tokens=4096,
         )
+
+        # OpenRouter: use openai-compatible base_url so ALL model IDs work,
+        # including meta-routers like openrouter/free, openrouter/auto.
+        # LiteLLM's native openrouter/ prefix chokes on those.
+        if provider == "openrouter":
+            key = get_provider_key(provider)
+            kwargs["api_key"] = key
+            kwargs["base_url"] = "https://openrouter.ai/api/v1"
+            # Tell LiteLLM to treat this as an OpenAI-compatible call.
+            # The model ID is sent as-is to OpenRouter's API.
+            kwargs["model"] = f"openai/{model}"
+
+        response = litellm.completion(**kwargs)
 
         return response
 
@@ -232,12 +246,44 @@ class Agent:
                 ]
             self.messages.append(assistant_msg)
 
-            # If no tool calls, we're done
-            if not msg.tool_calls:
+            # If no tool calls, check if the model emitted tool calls as text
+            # (common with weaker models like Qwen, Llama, etc.)
+            if not msg.tool_calls and msg.content:
+                parsed = self._try_parse_text_tool_call(msg.content)
+                if parsed:
+                    # Re-inject as a proper tool call
+                    tc_id = f"text_tc_{iteration}"
+                    self.messages[-1]["tool_calls"] = [{
+                        "id": tc_id,
+                        "type": "function",
+                        "function": {
+                            "name": parsed["name"],
+                            "arguments": json.dumps(parsed["args"]),
+                        },
+                    }]
+                    # Strip the tool call text from the content
+                    if self.messages[-1].get("content"):
+                        cleaned = self._strip_tool_call_text(self.messages[-1]["content"])
+                        if cleaned.strip():
+                            self.messages[-1]["content"] = cleaned
+                        else:
+                            del self.messages[-1]["content"]
+
+                    result = self._execute_tool(parsed["name"], parsed["args"])
+                    self.messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "content": result,
+                    })
+                    continue  # Let LLM see the result
+
                 text = msg.content or ""
                 if self.on_message:
                     self.on_message(text)
                 return text
+
+            if not msg.tool_calls:
+                return ""
 
             # Execute each tool call
             for tc in msg.tool_calls:
@@ -258,6 +304,53 @@ class Agent:
             # Continue loop — LLM will see tool results and decide next step
 
         return "(Max iterations reached. The task may be incomplete.)"
+
+    def _try_parse_text_tool_call(self, text: str) -> dict | None:
+        """Try to extract a tool call from text output.
+
+        Handles patterns like:
+          browser{"action": "open", "url": "..."}
+          browser({"action": "open"})
+          ```json\n{"name": "browser", "arguments": {...}}\n```
+        """
+        import re
+
+        # Pattern 1: toolname{...} or toolname({...})
+        tool_names = "|".join(re.escape(n) for n in self._tools.keys())
+        m = re.search(rf'({tool_names})\s*\(?\s*(\{{.*?\}})\s*\)?', text, re.DOTALL)
+        if m:
+            name = m.group(1)
+            try:
+                args = json.loads(m.group(2))
+                if isinstance(args, dict):
+                    return {"name": name, "args": args}
+            except json.JSONDecodeError:
+                pass
+
+        # Pattern 2: JSON block with name + arguments/parameters
+        json_blocks = re.findall(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
+        for block in json_blocks:
+            try:
+                obj = json.loads(block)
+                if "name" in obj and isinstance(obj.get("arguments") or obj.get("parameters"), dict):
+                    name = obj["name"]
+                    args = obj.get("arguments") or obj.get("parameters", {})
+                    if name in self._tools:
+                        return {"name": name, "args": args}
+            except json.JSONDecodeError:
+                pass
+
+        return None
+
+    def _strip_tool_call_text(self, text: str) -> str:
+        """Remove the tool call portion from text, keeping surrounding prose."""
+        import re
+        tool_names = "|".join(re.escape(n) for n in self._tools.keys())
+        # Remove toolname{...} patterns
+        text = re.sub(rf'({tool_names})\s*\(?\s*\{{.*?\}}\s*\)?', '', text, flags=re.DOTALL)
+        # Remove ```json blocks with tool calls
+        text = re.sub(r'```(?:json)?\s*\{[^`]*?"name"[^`]*?\}\s*```', '', text, flags=re.DOTALL)
+        return text.strip()
 
     def reset(self) -> None:
         """Clear conversation history."""

@@ -43,19 +43,35 @@ PROVIDERS = {
         "name": "AWS Bedrock",
         "env_key": "AWS_ACCESS_KEY_ID",
         "default_model": "bedrock/anthropic.claude-sonnet-4-20250514-v1:0",
-        "note": "Requires AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION_NAME",
+        "note": "Uses AWS credentials. Configure Access Key + Secret Key + Region, or use env vars / AWS CLI profile.",
+        "fields": [
+            {"key": "aws_access_key_id", "label": "AWS Access Key ID", "env": "AWS_ACCESS_KEY_ID", "secret": True},
+            {"key": "aws_secret_access_key", "label": "AWS Secret Access Key", "env": "AWS_SECRET_ACCESS_KEY", "secret": True},
+            {"key": "aws_region", "label": "AWS Region", "env": "AWS_REGION_NAME", "placeholder": "us-east-1"},
+            {"key": "aws_profile", "label": "AWS Profile (optional)", "env": "AWS_PROFILE", "placeholder": "default"},
+        ],
     },
     "azure": {
         "name": "Azure OpenAI",
         "env_key": "AZURE_API_KEY",
         "default_model": "azure/gpt-4o",
-        "note": "Requires AZURE_API_KEY, AZURE_API_BASE, AZURE_API_VERSION",
+        "note": "Requires API key, endpoint URL, and API version from your Azure OpenAI resource.",
+        "fields": [
+            {"key": "api_key", "label": "API Key", "secret": True},
+            {"key": "base_url", "label": "Endpoint URL", "placeholder": "https://your-resource.openai.azure.com"},
+            {"key": "api_version", "label": "API Version", "placeholder": "2024-02-01"},
+        ],
     },
     "vertex": {
         "name": "Google Vertex AI",
         "env_key": "GOOGLE_APPLICATION_CREDENTIALS",
         "default_model": "vertex_ai/gemini-2.0-flash",
-        "note": "Requires GOOGLE_APPLICATION_CREDENTIALS and VERTEXAI_PROJECT",
+        "note": "Uses Google Cloud auth. Set credentials file path + project ID, or use gcloud CLI auth.",
+        "fields": [
+            {"key": "credentials_path", "label": "Service Account JSON Path", "env": "GOOGLE_APPLICATION_CREDENTIALS", "placeholder": "/path/to/service-account.json"},
+            {"key": "project", "label": "Project ID", "env": "VERTEXAI_PROJECT", "placeholder": "my-gcp-project"},
+            {"key": "location", "label": "Location", "env": "VERTEXAI_LOCATION", "placeholder": "us-central1"},
+        ],
     },
 }
 
@@ -168,3 +184,53 @@ def is_configured() -> bool:
     """Check if the agent has been set up."""
     agent_cfg = get_agent_config()
     return bool(agent_cfg.get("provider") and agent_cfg.get("workspace"))
+
+
+def get_provider_credentials_status() -> dict[str, Any]:
+    """Get credential status for all providers (masked, never raw keys).
+
+    Returns dict like:
+    {
+        "openrouter": {"configured": True, "masked": "sk-or...ce3e", "source": "config"},
+        "bedrock": {"configured": True, "fields": {"aws_access_key_id": {"configured": True, "masked": "AKIA...XYZ"}, ...}},
+    }
+    """
+    agent_cfg = get_agent_config()
+    providers_cfg = agent_cfg.get("providers", {})
+    result: dict[str, Any] = {}
+
+    for pkey, pinfo in PROVIDERS.items():
+        pcfg = providers_cfg.get(pkey, {})
+        fields = pinfo.get("fields")
+
+        if fields:
+            # Multi-field provider (Bedrock, Azure, Vertex)
+            field_status = {}
+            any_configured = False
+            for f in fields:
+                fkey = f["key"]
+                val = pcfg.get(fkey) or os.environ.get(f.get("env", ""), "")
+                if val:
+                    any_configured = True
+                    source = "config" if pcfg.get(fkey) else "env"
+                    if f.get("secret"):
+                        masked = val[:4] + "..." + val[-4:] if len(val) > 10 else "***"
+                    else:
+                        masked = val
+                    field_status[fkey] = {"configured": True, "masked": masked, "source": source}
+                else:
+                    field_status[fkey] = {"configured": False}
+            result[pkey] = {"configured": any_configured, "fields": field_status}
+        else:
+            # Single API key provider
+            key = pcfg.get("api_key", "")
+            env_key = os.environ.get(pinfo.get("env_key", ""), "")
+            val = key or env_key
+            if val:
+                source = "config" if key else "env"
+                masked = val[:8] + "..." + val[-4:] if len(val) > 14 else val[:4] + "..."
+                result[pkey] = {"configured": True, "masked": masked, "source": source}
+            else:
+                result[pkey] = {"configured": False}
+
+    return result

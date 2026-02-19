@@ -127,8 +127,11 @@ async def history() -> JSONResponse:
 
 @app.get("/api/config")
 async def config() -> JSONResponse:
-    """Get agent configuration (no secrets)."""
+    """Get agent configuration (secrets masked, never raw)."""
+    from browser_py.agent.config import get_provider_credentials_status
     cfg = get_agent_config()
+    providers_cfg = cfg.get("providers", {})
+
     safe = {
         "provider": cfg.get("provider"),
         "model": cfg.get("model"),
@@ -136,7 +139,23 @@ async def config() -> JSONResponse:
         "browser_profile": cfg.get("browser_profile"),
         "shell_enabled": cfg.get("shell_enabled", True),
         "configured": is_configured(),
+        "credentials": get_provider_credentials_status(),
     }
+
+    # Include non-secret provider fields (base_url, api_version, region, etc.)
+    from browser_py.agent.config import PROVIDERS
+    provider_fields = {}
+    for pkey, pinfo in PROVIDERS.items():
+        fields = pinfo.get("fields", [])
+        pcfg = providers_cfg.get(pkey, {})
+        non_secret = {}
+        for f in fields:
+            if not f.get("secret"):
+                non_secret[f["key"]] = pcfg.get(f["key"], "")
+        if non_secret:
+            provider_fields[pkey] = non_secret
+    safe["provider_fields"] = provider_fields
+
     return JSONResponse(safe)
 
 
@@ -257,23 +276,43 @@ async def list_providers() -> JSONResponse:
     from browser_py.agent.config import PROVIDERS
     result = {}
     for key, info in PROVIDERS.items():
-        result[key] = {
+        entry = {
             "name": info["name"],
             "default_model": info["default_model"],
             "note": info.get("note", ""),
             "is_oauth": info.get("is_oauth", False),
         }
+        if info.get("fields"):
+            entry["fields"] = info["fields"]
+        result[key] = entry
     return JSONResponse(result)
 
 
 @app.get("/api/models/{provider}")
-async def get_models(provider: str, api_key: str | None = None) -> JSONResponse:
-    """Fetch available models for a provider (live from API, cached 10min)."""
+async def get_models(provider: str, api_key: str | None = None, q: str | None = None) -> JSONResponse:
+    """Fetch available models for a provider (live from API, cached 10min).
+
+    Optional query param `q` filters models client-side (search).
+    """
     from browser_py.agent.models import fetch_models
     import asyncio
 
+    # Gather extra credentials from config for Bedrock etc.
+    extra = {}
+    cfg = get_agent_config()
+    pcfg = cfg.get("providers", {}).get(provider, {})
+    for key in ("aws_access_key_id", "aws_secret_access_key", "aws_region", "aws_profile"):
+        if pcfg.get(key):
+            extra[key] = pcfg[key]
+
     loop = asyncio.get_event_loop()
-    models = await loop.run_in_executor(None, fetch_models, provider, api_key)
+    models = await loop.run_in_executor(None, fetch_models, provider, api_key, extra)
+
+    # Server-side search filter
+    if q:
+        q_lower = q.lower()
+        models = [m for m in models if q_lower in m["id"].lower() or q_lower in m.get("name", "").lower()]
+
     return JSONResponse({"models": models})
 
 
@@ -298,18 +337,28 @@ async def run_setup(body: dict) -> JSONResponse:
 
     agent_cfg["provider"] = provider
 
-    # Store API key
+    # Store API key (simple providers)
+    providers_cfg = agent_cfg.get("providers", {})
     if api_key:
-        providers_cfg = agent_cfg.get("providers", {})
         providers_cfg.setdefault(provider, {})["api_key"] = api_key
-        agent_cfg["providers"] = providers_cfg
+    agent_cfg["providers"] = providers_cfg
 
-    # Azure extra fields
-    if provider == "azure":
+    # Store provider-specific fields (Bedrock, Azure, Vertex, etc.)
+    from browser_py.agent.config import PROVIDERS as PROVIDER_DEFS
+    pinfo = PROVIDER_DEFS.get(provider, {})
+    if pinfo.get("fields"):
+        pcfg = providers_cfg.setdefault(provider, {})
+        for f in pinfo["fields"]:
+            fkey = f["key"]
+            val = body.get(fkey)
+            if val is not None and val != "":
+                pcfg[fkey] = val
+    # Legacy Azure fields (backward compat)
+    elif provider == "azure":
         if body.get("azure_endpoint"):
-            agent_cfg.setdefault("providers", {}).setdefault("azure", {})["base_url"] = body["azure_endpoint"]
+            providers_cfg.setdefault("azure", {})["base_url"] = body["azure_endpoint"]
         if body.get("azure_api_version"):
-            agent_cfg.setdefault("providers", {}).setdefault("azure", {})["api_version"] = body["azure_api_version"]
+            providers_cfg.setdefault("azure", {})["api_version"] = body["azure_api_version"]
 
     if model:
         agent_cfg["model"] = model
@@ -650,6 +699,37 @@ _FALLBACK_HTML = """\
   .list-item .name { font-weight: 500; flex: 1; }
   .list-item .meta { color: var(--text-dim); font-size: 12px; }
   .empty { color: var(--text-dim); font-size: 13px; padding: 20px 0; text-align: center; }
+
+  /* Credential status badges */
+  .key-status { font-size: 11px; margin-top: 4px; }
+  .key-status.configured { color: var(--success); }
+  .key-status.missing { color: var(--text-dim); }
+
+  /* Searchable model picker */
+  .model-search-wrap { position: relative; }
+  .model-search-wrap input { width: 100%; }
+  .model-search-wrap .model-dropdown {
+    display: none; position: absolute; top: 100%; left: 0; right: 0;
+    max-height: 280px; overflow-y: auto; background: var(--surface);
+    border: 1px solid var(--border); border-top: none; border-radius: 0 0 6px 6px;
+    z-index: 100;
+  }
+  .model-search-wrap .model-dropdown.open { display: block; }
+  .model-search-wrap .model-dropdown .model-opt {
+    padding: 6px 12px; font-size: 13px; cursor: pointer; display: flex;
+    justify-content: space-between; align-items: center;
+  }
+  .model-search-wrap .model-dropdown .model-opt:hover,
+  .model-search-wrap .model-dropdown .model-opt.highlighted {
+    background: rgba(88,166,255,0.12);
+  }
+  .model-search-wrap .model-dropdown .model-opt .model-id { color: var(--text); }
+  .model-search-wrap .model-dropdown .model-opt .model-meta {
+    color: var(--text-dim); font-size: 11px;
+  }
+  .model-search-wrap .model-count {
+    font-size: 11px; color: var(--text-dim); margin-top: 4px;
+  }
 </style>
 </head>
 <body>
@@ -679,35 +759,21 @@ _FALLBACK_HTML = """\
         <h3>1. LLM Provider</h3>
         <div class="field">
           <label>Provider</label>
-          <select id="setup-provider" onchange="onProviderChange()">
+          <select id="setup-provider" onchange="onSetupProviderChange()">
             <option value="">— Select —</option>
           </select>
         </div>
         <div id="setup-provider-note" style="font-size:12px;color:var(--text-dim);margin-bottom:12px;display:none"></div>
-        <div class="field" id="setup-key-field">
-          <label id="setup-key-label">API Key</label>
-          <input type="password" id="setup-key" placeholder="sk-..." autocomplete="off">
-          <p id="setup-key-hint" style="font-size:11px;color:var(--text-dim);margin-top:4px"></p>
-        </div>
-        <div id="setup-azure-fields" style="display:none">
-          <div class="field">
-            <label>Azure Endpoint URL</label>
-            <input type="text" id="setup-azure-endpoint" placeholder="https://your-resource.openai.azure.com">
-          </div>
-          <div class="field">
-            <label>API Version</label>
-            <input type="text" id="setup-azure-version" value="2024-02-01">
-          </div>
-        </div>
+        <!-- Simple key field for single-key providers -->
+        <div id="setup-key-section"></div>
+        <!-- Dynamic fields for multi-field providers (Bedrock, Azure, Vertex) -->
+        <div id="setup-provider-fields"></div>
       </div>
 
       <div class="card">
         <h3>2. Model</h3>
-        <div class="field">
-          <label>Model</label>
-          <select id="setup-model"></select>
-        </div>
-        <div class="field">
+        <div id="setup-model-picker"></div>
+        <div class="field" style="margin-top:8px">
           <label>Or type a custom model name</label>
           <input type="text" id="setup-model-custom" placeholder="Leave empty to use selection above">
         </div>
@@ -805,32 +871,22 @@ _FALLBACK_HTML = """\
     <header><h2>Settings</h2></header>
     <div class="page-content">
       <div class="card">
-        <h3>LLM Provider</h3>
+        <h3>LLM Provider &amp; Credentials</h3>
         <div class="field">
           <label>Provider</label>
           <select id="cfg-provider" onchange="onCfgProviderChange()"></select>
         </div>
-        <div class="field" id="cfg-key-field">
-          <label id="cfg-key-label">API Key</label>
-          <input type="password" id="cfg-key" placeholder="Enter new key to change (leave empty to keep current)" autocomplete="off">
-        </div>
-        <div id="cfg-azure-fields" style="display:none">
-          <div class="field">
-            <label>Azure Endpoint URL</label>
-            <input type="text" id="cfg-azure-endpoint">
-          </div>
-          <div class="field">
-            <label>API Version</label>
-            <input type="text" id="cfg-azure-version">
-          </div>
-        </div>
-        <div class="field">
-          <label>Model</label>
-          <select id="cfg-model-select" onchange="document.getElementById('cfg-model').value=this.value"></select>
-        </div>
-        <div class="field">
-          <label>Custom model (overrides dropdown)</label>
-          <input type="text" id="cfg-model" placeholder="Leave empty to use dropdown">
+        <div id="cfg-credentials-status"></div>
+        <!-- Dynamic credential fields rendered here -->
+        <div id="cfg-key-section"></div>
+        <div id="cfg-provider-fields"></div>
+      </div>
+      <div class="card">
+        <h3>Model</h3>
+        <div id="cfg-model-picker"></div>
+        <div class="field" style="margin-top:8px">
+          <label>Custom model (overrides search above)</label>
+          <input type="text" id="cfg-model" placeholder="Leave empty to use selection above">
         </div>
       </div>
       <div class="card">
@@ -859,33 +915,252 @@ _FALLBACK_HTML = """\
 
 <script>
 const chatEl = document.getElementById('chat-messages');
-const input = document.getElementById('input');
+const inputEl = document.getElementById('input');
 const sendBtn = document.getElementById('send');
-const status = document.getElementById('status');
-let ws, providers = {};
+const statusEl = document.getElementById('status');
+let ws, providers = {}, currentCfg = {};
+
+// ── Model Picker Component ──
+// A searchable combo-box that replaces the old <select>
+class ModelPicker {
+  constructor(containerId, opts = {}) {
+    this.container = document.getElementById(containerId);
+    this.allModels = [];
+    this.filtered = [];
+    this.selectedValue = '';
+    this.highlightIdx = -1;
+    this.onSelect = opts.onSelect || (() => {});
+    this._render();
+  }
+
+  _render() {
+    this.container.innerHTML = `
+      <div class="field">
+        <label>MODEL</label>
+        <div class="model-search-wrap">
+          <input type="text" class="model-search-input" placeholder="Search models..." autocomplete="off">
+          <div class="model-dropdown"></div>
+          <div class="model-count"></div>
+        </div>
+      </div>`;
+    this.inputEl = this.container.querySelector('.model-search-input');
+    this.dropdown = this.container.querySelector('.model-dropdown');
+    this.countEl = this.container.querySelector('.model-count');
+
+    this.inputEl.addEventListener('focus', () => this._showDropdown());
+    this.inputEl.addEventListener('input', () => this._onInput());
+    this.inputEl.addEventListener('keydown', (e) => this._onKeydown(e));
+    document.addEventListener('click', (e) => {
+      if (!this.container.contains(e.target)) this._hideDropdown();
+    });
+  }
+
+  setModels(models, defaultValue) {
+    this.allModels = models;
+    this.filtered = models;
+    this._updateCount();
+    if (defaultValue) {
+      this.selectedValue = defaultValue;
+      const m = models.find(m => m.id === defaultValue);
+      if (m) {
+        this.inputEl.value = m.id;
+      } else {
+        this.inputEl.value = defaultValue;
+      }
+    }
+    this._renderOptions();
+  }
+
+  getValue() {
+    return this.selectedValue || this.inputEl.value.trim();
+  }
+
+  setLoading() {
+    this.allModels = [];
+    this.filtered = [];
+    this.inputEl.placeholder = 'Loading models...';
+    this.countEl.textContent = '';
+    this.dropdown.innerHTML = '<div style="padding:8px 12px;color:var(--text-dim);font-size:12px">Loading...</div>';
+  }
+
+  _onInput() {
+    const q = this.inputEl.value.toLowerCase().trim();
+    if (!q) {
+      this.filtered = this.allModels;
+    } else {
+      this.filtered = this.allModels.filter(m =>
+        m.id.toLowerCase().includes(q) || (m.name || '').toLowerCase().includes(q)
+      );
+    }
+    this.highlightIdx = -1;
+    this._renderOptions();
+    this._showDropdown();
+    this._updateCount();
+    // If user types a model ID directly, accept it
+    this.selectedValue = this.inputEl.value.trim();
+  }
+
+  _onKeydown(e) {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      this.highlightIdx = Math.min(this.highlightIdx + 1, this.filtered.length - 1);
+      this._renderOptions();
+      this._scrollToHighlighted();
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      this.highlightIdx = Math.max(this.highlightIdx - 1, 0);
+      this._renderOptions();
+      this._scrollToHighlighted();
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      if (this.highlightIdx >= 0 && this.highlightIdx < this.filtered.length) {
+        this._select(this.filtered[this.highlightIdx]);
+      }
+      this._hideDropdown();
+    } else if (e.key === 'Escape') {
+      this._hideDropdown();
+    }
+  }
+
+  _select(model) {
+    this.selectedValue = model.id;
+    this.inputEl.value = model.id;
+    this._hideDropdown();
+    this.onSelect(model);
+  }
+
+  _showDropdown() {
+    if (this.filtered.length) this.dropdown.classList.add('open');
+  }
+  _hideDropdown() {
+    this.dropdown.classList.remove('open');
+  }
+
+  _scrollToHighlighted() {
+    const el = this.dropdown.querySelector('.highlighted');
+    if (el) el.scrollIntoView({ block: 'nearest' });
+  }
+
+  _updateCount() {
+    const total = this.allModels.length;
+    const shown = this.filtered.length;
+    if (total > 20) {
+      this.countEl.textContent = shown === total
+        ? `${total} models available — type to search`
+        : `${shown} of ${total} models`;
+    } else {
+      this.countEl.textContent = '';
+    }
+    this.inputEl.placeholder = total > 20 ? 'Type to search models...' : 'Search or select a model...';
+  }
+
+  _renderOptions() {
+    // Cap rendered items at 100 for performance
+    const toRender = this.filtered.slice(0, 100);
+    this.dropdown.innerHTML = toRender.map((m, i) => {
+      const hl = i === this.highlightIdx ? ' highlighted' : '';
+      const nameStr = m.name && m.name !== m.id ? m.name : '';
+      const ctxStr = m.context ? `${Math.round(m.context/1000)}k ctx` : '';
+      const meta = [nameStr, ctxStr].filter(Boolean).join(' · ');
+      return `<div class="model-opt${hl}" data-idx="${i}">
+        <span class="model-id">${m.id}</span>
+        ${meta ? `<span class="model-meta">${meta}</span>` : ''}
+      </div>`;
+    }).join('');
+
+    if (this.filtered.length > 100) {
+      this.dropdown.innerHTML += `<div style="padding:6px 12px;color:var(--text-dim);font-size:11px;text-align:center">
+        ${this.filtered.length - 100} more — refine your search</div>`;
+    }
+
+    if (!this.filtered.length) {
+      this.dropdown.innerHTML = '<div style="padding:8px 12px;color:var(--text-dim);font-size:12px">No models match</div>';
+    }
+
+    // Click handlers
+    this.dropdown.querySelectorAll('.model-opt').forEach(el => {
+      el.addEventListener('click', () => {
+        const idx = parseInt(el.dataset.idx);
+        this._select(this.filtered[idx]);
+      });
+    });
+  }
+}
+
+// ── Provider Fields Rendering ──
+function renderProviderFields(provider, containerId, credentials, providerFields) {
+  const el = document.getElementById(containerId);
+  const info = providers[provider] || {};
+  const creds = (credentials || {})[provider] || {};
+
+  if (info.fields) {
+    // Multi-field provider
+    el.innerHTML = info.fields.map(f => {
+      const fieldCred = (creds.fields || {})[f.key] || {};
+      const statusHtml = fieldCred.configured
+        ? `<div class="key-status configured">✓ Configured (${fieldCred.masked}) — ${fieldCred.source}</div>`
+        : `<div class="key-status missing">Not configured</div>`;
+      const inputType = f.secret ? 'password' : 'text';
+      const placeholder = fieldCred.configured
+        ? 'Leave empty to keep current'
+        : (f.placeholder || '');
+      // Pre-fill non-secret fields from providerFields
+      const prefill = !f.secret && providerFields && providerFields[provider]
+        ? (providerFields[provider][f.key] || '') : '';
+      return `<div class="field">
+        <label>${f.label}</label>
+        <input type="${inputType}" data-field-key="${f.key}" placeholder="${placeholder}" value="${prefill}" autocomplete="off">
+        ${statusHtml}
+      </div>`;
+    }).join('');
+    return;
+  }
+
+  // Single API key provider
+  const keySection = document.getElementById(containerId.replace('provider-fields', 'key-section'));
+  if (keySection) {
+    const isOauth = info.is_oauth;
+    const label = isOauth ? 'OAuth Token' : 'API Key';
+    const placeholder = creds.configured
+      ? 'Leave empty to keep current'
+      : (isOauth ? 'sk-ant-oat01-...' : 'sk-...');
+    const statusHtml = creds.configured
+      ? `<div class="key-status configured">✓ Configured (${creds.masked}) — from ${creds.source}</div>`
+      : `<div class="key-status missing">Not configured</div>`;
+    const hint = isOauth
+      ? '<p style="font-size:11px;color:var(--text-dim);margin-top:4px">From your Claude Max/Pro subscription. Same token Claude Code uses.</p>'
+      : '';
+
+    keySection.innerHTML = `<div class="field">
+      <label>${label}</label>
+      <input type="password" id="${containerId.replace('provider-fields','key')}" placeholder="${placeholder}" autocomplete="off">
+      ${statusHtml}
+      ${hint}
+    </div>`;
+  }
+  el.innerHTML = '';
+}
 
 // ── Init ──
 async function init() {
-  // Load providers
   const pres = await fetch('/api/providers');
   providers = await pres.json();
 
-  // Check if configured
   const cres = await fetch('/api/config');
-  const cfg = await cres.json();
+  currentCfg = await cres.json();
 
-  if (!cfg.configured) {
-    await initSetupPage(cfg);
+  if (!currentCfg.configured) {
+    await initSetupPage(currentCfg);
     showPage('setup');
   } else {
     connect();
-    loadVersionInfo(cfg);
+    loadVersionInfo(currentCfg);
   }
 }
 
 function loadVersionInfo(cfg) {
   document.getElementById('version-info').textContent =
-    `${providers[cfg.provider]?.name || cfg.provider} · ${cfg.model?.split('/').pop() || ''}`;
+    `${providers[cfg.provider]?.name || cfg.provider} · ${(cfg.model || '').split('/').pop() || ''}`;
 }
 
 // ── Navigation ──
@@ -902,7 +1177,9 @@ function showPage(name) {
 }
 
 // ── Setup Page ──
+let setupModelPicker;
 async function initSetupPage(cfg) {
+  cfg = cfg || currentCfg;
   const sel = document.getElementById('setup-provider');
   sel.innerHTML = '<option value="">— Select —</option>' +
     Object.entries(providers).map(([k,v]) => {
@@ -910,25 +1187,23 @@ async function initSetupPage(cfg) {
       return `<option value="${k}">${v.name}${tag}</option>`;
     }).join('');
 
-  // Default workspace
-  const wsInput = document.getElementById('setup-workspace');
-  if (!wsInput.value) {
-    wsInput.value = cfg?.workspace || '~/browser-py-workspace';
+  // Init model picker
+  if (!setupModelPicker) {
+    setupModelPicker = new ModelPicker('setup-model-picker');
   }
 
-  // Load existing profiles into dropdown
+  const wsInput = document.getElementById('setup-workspace');
+  if (!wsInput.value) wsInput.value = cfg?.workspace || '~/browser-py-workspace';
+
   await loadSetupProfiles();
 
-  // If already configured, pre-fill
   if (cfg?.provider) {
     sel.value = cfg.provider;
-    onProviderChange();
+    await onSetupProviderChange();
     if (cfg.model) {
       const custom = document.getElementById('setup-model-custom');
-      const msel = document.getElementById('setup-model');
-      if ([...msel.options].some(o => o.value === cfg.model)) {
-        msel.value = cfg.model;
-      } else {
+      setupModelPicker.setModels(setupModelPicker.allModels, cfg.model);
+      if (!setupModelPicker.allModels.find(m => m.id === cfg.model)) {
         custom.value = cfg.model;
       }
     }
@@ -949,84 +1224,69 @@ async function loadSetupProfiles() {
   }
 }
 
-async function onProviderChange() {
+async function onSetupProviderChange() {
   const p = document.getElementById('setup-provider').value;
   const info = providers[p] || {};
-
-  // Key label & hint
-  const keyLabel = document.getElementById('setup-key-label');
-  const keyInput = document.getElementById('setup-key');
-  const keyHint = document.getElementById('setup-key-hint');
-  const keyField = document.getElementById('setup-key-field');
   const note = document.getElementById('setup-provider-note');
-  const azureFields = document.getElementById('setup-azure-fields');
 
-  azureFields.style.display = p === 'azure' ? 'block' : 'none';
+  // Show note
+  if (info.note) { note.textContent = info.note; note.style.display = 'block'; }
+  else { note.style.display = 'none'; }
 
-  if (info.is_oauth) {
-    keyLabel.textContent = 'OAuth Token';
-    keyInput.placeholder = 'sk-ant-oat01-...';
-    keyHint.textContent = 'From your Claude Max/Pro subscription. Same token Claude Code uses.';
-    keyField.style.display = '';
-  } else if (p === 'bedrock' || p === 'vertex') {
-    keyField.style.display = 'none';
-    note.style.display = 'block';
-    note.textContent = info.note;
+  // Render credential fields
+  renderProviderFields(p, 'setup-provider-fields', currentCfg.credentials, currentCfg.provider_fields);
+
+  // For single-key providers, render key section
+  if (!info.fields) {
+    const keySection = document.getElementById('setup-key-section');
+    const isOauth = info.is_oauth;
+    const creds = (currentCfg.credentials || {})[p] || {};
+    const label = isOauth ? 'OAuth Token' : 'API Key';
+    const placeholder = creds.configured ? 'Leave empty to keep current' : (isOauth ? 'sk-ant-oat01-...' : 'sk-...');
+    const statusHtml = creds.configured
+      ? `<div class="key-status configured">✓ Configured (${creds.masked}) — from ${creds.source}</div>`
+      : '';
+    const hint = isOauth
+      ? '<p style="font-size:11px;color:var(--text-dim);margin-top:4px">From your Claude Max/Pro subscription.</p>'
+      : '';
+    keySection.innerHTML = `<div class="field">
+      <label>${label}</label>
+      <input type="password" id="setup-key" placeholder="${placeholder}" autocomplete="off">
+      ${statusHtml}${hint}
+    </div>`;
   } else {
-    keyLabel.textContent = 'API Key';
-    keyInput.placeholder = 'sk-...';
-    keyHint.textContent = '';
-    keyField.style.display = '';
+    document.getElementById('setup-key-section').innerHTML = '';
   }
-  note.style.display = info.note && p !== 'bedrock' && p !== 'vertex' ? 'block' : 'none';
-  if (p !== 'bedrock' && p !== 'vertex') note.textContent = info.note || '';
 
-  // Fetch models live
-  await loadModelsForProvider(p, 'setup-model', info.default_model);
+  // Fetch models
+  await loadModelsForPicker(p, setupModelPicker, info.default_model);
 }
 
-// Debounced key input → refresh models
-let _keyTimer;
-document.getElementById('setup-key')?.addEventListener('input', function() {
-  clearTimeout(_keyTimer);
-  _keyTimer = setTimeout(async () => {
-    const p = document.getElementById('setup-provider').value;
-    const key = this.value.trim();
-    if (key.length > 10 && p) {
-      await loadModelsForProvider(p, 'setup-model', providers[p]?.default_model, key);
-    }
-  }, 800);
-});
-
-async function loadModelsForProvider(provider, selectId, defaultModel, apiKey) {
-  const msel = document.getElementById(selectId);
-  msel.innerHTML = '<option value="">Loading models...</option>';
-
+async function loadModelsForPicker(provider, picker, defaultModel, apiKey) {
+  picker.setLoading();
   try {
     let url = '/api/models/' + provider;
     if (apiKey) url += '?api_key=' + encodeURIComponent(apiKey);
     const res = await fetch(url);
     const data = await res.json();
-    const models = data.models || [];
-
-    if (!models.length) {
-      msel.innerHTML = '<option value="">No models found</option>';
-      return;
-    }
-
-    msel.innerHTML = models.map(m => {
-      const label = m.name !== m.id ? `${m.name} (${m.id})` : m.id;
-      return `<option value="${m.id}">${label}</option>`;
-    }).join('');
-
-    // Select default
-    if (defaultModel && [...msel.options].some(o => o.value === defaultModel)) {
-      msel.value = defaultModel;
-    }
+    picker.setModels(data.models || [], defaultModel);
   } catch(e) {
-    msel.innerHTML = '<option value="">Failed to load models</option>';
+    picker.setModels([], null);
   }
 }
+
+// Debounced key input → refresh models for setup
+document.addEventListener('input', function(e) {
+  if (e.target.id !== 'setup-key') return;
+  clearTimeout(window._setupKeyTimer);
+  window._setupKeyTimer = setTimeout(async () => {
+    const p = document.getElementById('setup-provider').value;
+    const key = e.target.value.trim();
+    if (key.length > 10 && p) {
+      await loadModelsForPicker(p, setupModelPicker, providers[p]?.default_model, key);
+    }
+  }, 800);
+});
 
 async function setupCreateProfile() {
   const nameInput = document.getElementById('setup-new-profile');
@@ -1051,15 +1311,32 @@ async function submitSetup() {
   const provider = document.getElementById('setup-provider').value;
   if (!provider) { errEl.textContent = 'Please select a provider.'; errEl.style.display = 'block'; return; }
 
-  const api_key = document.getElementById('setup-key')?.value || '';
+  const info = providers[provider] || {};
   const modelCustom = document.getElementById('setup-model-custom').value.trim();
-  const modelSelect = document.getElementById('setup-model').value;
-  const model = modelCustom || modelSelect;
+  const model = modelCustom || setupModelPicker.getValue();
   const workspace = document.getElementById('setup-workspace').value.trim() || '~/browser-py-workspace';
   const browser_profile = document.getElementById('setup-browser-profile').value || 'default';
   const shell_enabled = document.getElementById('setup-shell').checked;
 
-  if (!api_key && provider !== 'bedrock' && provider !== 'vertex') {
+  const body = { provider, model, workspace, browser_profile, shell_enabled };
+
+  // Collect credentials
+  if (info.fields) {
+    const fieldInputs = document.querySelectorAll('#setup-provider-fields [data-field-key]');
+    fieldInputs.forEach(inp => {
+      const val = inp.value.trim();
+      if (val) body[inp.dataset.fieldKey] = val;
+    });
+  } else {
+    const keyEl = document.getElementById('setup-key');
+    if (keyEl && keyEl.value.trim()) body.api_key = keyEl.value.trim();
+  }
+
+  // Check if any credentials exist (from config or new input)
+  const creds = (currentCfg.credentials || {})[provider] || {};
+  const hasExistingCreds = creds.configured;
+  const hasNewKey = body.api_key || Object.keys(body).some(k => info.fields?.some(f => f.key === k));
+  if (!hasExistingCreds && !hasNewKey && !['bedrock','vertex'].includes(provider)) {
     errEl.textContent = 'API key is required.';
     errEl.style.display = 'block';
     return;
@@ -1068,13 +1345,6 @@ async function submitSetup() {
   btn.disabled = true;
   btn.textContent = 'Saving...';
 
-  const body = { provider, model, workspace, browser_profile, shell_enabled };
-  if (api_key) body.api_key = api_key;
-  if (provider === 'azure') {
-    body.azure_endpoint = document.getElementById('setup-azure-endpoint')?.value || '';
-    body.azure_api_version = document.getElementById('setup-azure-version')?.value || '';
-  }
-
   try {
     const res = await fetch('/api/setup', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -1082,23 +1352,17 @@ async function submitSetup() {
     });
     const data = await res.json();
     if (data.error) {
-      errEl.textContent = data.error;
-      errEl.style.display = 'block';
-      btn.disabled = false;
-      btn.textContent = 'Save & Start';
-      return;
+      errEl.textContent = data.error; errEl.style.display = 'block';
+      btn.disabled = false; btn.textContent = 'Save & Start'; return;
     }
-
-    // Success — go to chat
     connect();
     const cres = await fetch('/api/config');
-    const cfg = await cres.json();
-    loadVersionInfo(cfg);
+    currentCfg = await cres.json();
+    loadVersionInfo(currentCfg);
     showPage('chat');
     addMsg('Setup complete! How can I help?', 'agent');
   } catch(e) {
-    errEl.textContent = 'Setup failed: ' + e;
-    errEl.style.display = 'block';
+    errEl.textContent = 'Setup failed: ' + e; errEl.style.display = 'block';
   }
   btn.disabled = false;
   btn.textContent = 'Save & Start';
@@ -1108,8 +1372,8 @@ async function submitSetup() {
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${proto}//${location.host}/ws`);
-  ws.onopen = () => { status.textContent = 'Connected'; };
-  ws.onclose = () => { status.textContent = 'Disconnected'; setTimeout(connect, 2000); };
+  ws.onopen = () => { statusEl.textContent = 'Connected'; };
+  ws.onclose = () => { statusEl.textContent = 'Disconnected'; setTimeout(connect, 2000); };
   ws.onmessage = (e) => {
     const msg = JSON.parse(e.data);
     if (msg.type === 'thinking') {
@@ -1118,15 +1382,15 @@ function connect() {
     } else if (msg.type === 'tool_call') {
       removeThinking();
       const action = msg.params?.action || '';
-      const detail = action ? ` → ${action}` : '';
-      let text = `🔧 ${msg.tool}${detail}`;
+      const detail = action ? ` \\u2192 ${action}` : '';
+      let text = `\\ud83d\\udd27 ${msg.tool}${detail}`;
       if (msg.result) text += '\\n' + msg.result.slice(0, 500);
       addMsg(text, 'tool');
     } else if (msg.type === 'response') {
       removeThinking();
       addMsg(msg.content, 'agent');
       sendBtn.disabled = false;
-      input.focus();
+      inputEl.focus();
     } else if (msg.type === 'reset_ok') {
       chatEl.innerHTML = '';
       addMsg('Chat cleared. How can I help?', 'agent');
@@ -1155,12 +1419,12 @@ function removeThinking() {
 }
 
 function send() {
-  const text = input.value.trim();
+  const text = inputEl.value.trim();
   if (!text || sendBtn.disabled) return;
   addMsg(text, 'user');
   ws.send(JSON.stringify({ type: 'chat', message: text }));
-  input.value = '';
-  input.style.height = 'auto';
+  inputEl.value = '';
+  inputEl.style.height = 'auto';
   sendBtn.disabled = true;
 }
 
@@ -1168,7 +1432,7 @@ function resetChat() {
   if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'reset' }));
 }
 
-input.addEventListener('input', function() {
+inputEl.addEventListener('input', function() {
   this.style.height = 'auto';
   this.style.height = Math.min(this.scrollHeight, 120) + 'px';
 });
@@ -1178,7 +1442,7 @@ async function loadProfiles() {
   const res = await fetch('/api/profiles/status');
   const data = await res.json();
   const el = document.getElementById('profiles-list');
-  if (!data.profiles?.length) { el.innerHTML = '<div class="empty">No profiles yet. Create one below.</div>'; return; }
+  if (!data.profiles?.length) { el.innerHTML = '<div class="empty">No profiles yet.</div>'; return; }
   el.innerHTML = data.profiles.map(p => `
     <div class="list-item">
       <span class="name">${p.name}</span>
@@ -1239,31 +1503,38 @@ async function loadJobs() {
 }
 
 // ── Settings Page ──
+let cfgModelPicker;
 async function loadSettingsPage() {
   const cres = await fetch('/api/config');
-  const cfg = await cres.json();
+  currentCfg = await cres.json();
+  const cfg = currentCfg;
 
   // Provider dropdown
   const provSel = document.getElementById('cfg-provider');
   provSel.innerHTML = Object.entries(providers).map(([k,v]) =>
     `<option value="${k}" ${k === cfg.provider ? 'selected' : ''}>${v.name}</option>`
   ).join('');
-  onCfgProviderChange();
 
-  // Model — fetch live
-  await loadModelsForProvider(cfg.provider, 'cfg-model-select', cfg.model);
-  const msel = document.getElementById('cfg-model-select');
-  // If current model is in the list, clear custom input; otherwise put it there
-  if ([...msel.options].some(o => o.value === cfg.model)) {
-    msel.value = cfg.model;
-    document.getElementById('cfg-model').value = '';
-  } else {
-    document.getElementById('cfg-model').value = cfg.model || '';
+  // Init model picker
+  if (!cfgModelPicker) {
+    cfgModelPicker = new ModelPicker('cfg-model-picker');
+  }
+
+  await onCfgProviderChange();
+
+  // Set model value
+  if (cfg.model) {
+    const found = cfgModelPicker.allModels.find(m => m.id === cfg.model);
+    if (found) {
+      cfgModelPicker.setModels(cfgModelPicker.allModels, cfg.model);
+      document.getElementById('cfg-model').value = '';
+    } else {
+      document.getElementById('cfg-model').value = cfg.model || '';
+    }
   }
 
   // Workspace
   document.getElementById('cfg-workspace').value = cfg.workspace || '';
-
   // Shell
   document.getElementById('cfg-shell').checked = cfg.shell_enabled !== false;
 
@@ -1274,44 +1545,64 @@ async function loadSettingsPage() {
   psel.innerHTML = (pdata.profiles || []).map(p =>
     `<option value="${p.name}" ${p.name === cfg.browser_profile ? 'selected' : ''}>${p.name} (port ${p.port})</option>`
   ).join('');
-
-  document.getElementById('cfg-azure-fields').style.display =
-    cfg.provider === 'azure' ? 'block' : 'none';
 }
 
 async function onCfgProviderChange() {
   const p = document.getElementById('cfg-provider').value;
   const info = providers[p] || {};
 
-  // Key field label
-  const keyLabel = document.getElementById('cfg-key-label');
-  if (info.is_oauth) keyLabel.textContent = 'OAuth Token';
-  else keyLabel.textContent = 'API Key';
+  // Show credential status
+  const statusEl = document.getElementById('cfg-credentials-status');
+  const creds = (currentCfg.credentials || {})[p] || {};
+  if (info.fields) {
+    // Multi-field: show per-field status
+    document.getElementById('cfg-key-section').innerHTML = '';
+    renderProviderFields(p, 'cfg-provider-fields', currentCfg.credentials, currentCfg.provider_fields);
+    statusEl.innerHTML = '';
+    if (info.note) statusEl.innerHTML = `<p style="font-size:12px;color:var(--text-dim);margin:8px 0">${info.note}</p>`;
+  } else {
+    // Single key
+    document.getElementById('cfg-provider-fields').innerHTML = '';
+    const isOauth = info.is_oauth;
+    const label = isOauth ? 'OAuth Token' : 'API Key';
+    const placeholder = creds.configured ? 'Leave empty to keep current' : (isOauth ? 'sk-ant-oat01-...' : 'sk-...');
+    const credStatus = creds.configured
+      ? `<div class="key-status configured">✓ Configured (${creds.masked}) — from ${creds.source}</div>`
+      : `<div class="key-status missing">Not configured</div>`;
+    document.getElementById('cfg-key-section').innerHTML = `<div class="field">
+      <label>${label}</label>
+      <input type="password" id="cfg-key" placeholder="${placeholder}" autocomplete="off">
+      ${credStatus}
+    </div>`;
+    statusEl.innerHTML = info.note ? `<p style="font-size:12px;color:var(--text-dim);margin:8px 0">${info.note}</p>` : '';
+  }
 
-  const keyField = document.getElementById('cfg-key-field');
-  keyField.style.display = (p === 'bedrock' || p === 'vertex') ? 'none' : '';
-
-  document.getElementById('cfg-azure-fields').style.display = p === 'azure' ? 'block' : 'none';
-
-  // Fetch models live
-  await loadModelsForProvider(p, 'cfg-model-select', info.default_model);
+  // Fetch models
+  if (!cfgModelPicker) cfgModelPicker = new ModelPicker('cfg-model-picker');
+  await loadModelsForPicker(p, cfgModelPicker, info.default_model);
 }
 
 async function saveSettings() {
   const provider = document.getElementById('cfg-provider').value;
-  const api_key = document.getElementById('cfg-key').value.trim();
+  const info = providers[provider] || {};
   const modelCustom = document.getElementById('cfg-model').value.trim();
-  const modelSelect = document.getElementById('cfg-model-select').value;
-  const model = modelCustom || modelSelect;
+  const model = modelCustom || cfgModelPicker.getValue();
   const workspace = document.getElementById('cfg-workspace').value.trim();
   const shell_enabled = document.getElementById('cfg-shell').checked;
   const browser_profile = document.getElementById('cfg-profile').value;
 
   const body = { provider, model, workspace, browser_profile, shell_enabled };
-  if (api_key) body.api_key = api_key;
-  if (provider === 'azure') {
-    body.azure_endpoint = document.getElementById('cfg-azure-endpoint')?.value || '';
-    body.azure_api_version = document.getElementById('cfg-azure-version')?.value || '';
+
+  // Collect credentials
+  if (info.fields) {
+    const fieldInputs = document.querySelectorAll('#cfg-provider-fields [data-field-key]');
+    fieldInputs.forEach(inp => {
+      const val = inp.value.trim();
+      if (val) body[inp.dataset.fieldKey] = val;
+    });
+  } else {
+    const keyEl = document.getElementById('cfg-key');
+    if (keyEl && keyEl.value.trim()) body.api_key = keyEl.value.trim();
   }
 
   await fetch('/api/setup', {
@@ -1324,7 +1615,8 @@ async function saveSettings() {
   setTimeout(() => savedEl.style.display = 'none', 3000);
 
   const cres = await fetch('/api/config');
-  loadVersionInfo(await cres.json());
+  currentCfg = await cres.json();
+  loadVersionInfo(currentCfg);
 }
 
 init();

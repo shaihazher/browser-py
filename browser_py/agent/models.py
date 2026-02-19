@@ -48,20 +48,33 @@ _FALLBACKS: dict[str, list[dict]] = {
     ],
     "bedrock": [
         {"id": "bedrock/anthropic.claude-sonnet-4-20250514-v1:0", "name": "Claude Sonnet 4 (Bedrock)"},
+        {"id": "bedrock/anthropic.claude-opus-4-20250514-v1:0", "name": "Claude Opus 4 (Bedrock)"},
         {"id": "bedrock/anthropic.claude-haiku-4-5-20251212-v1:0", "name": "Claude Haiku 4.5 (Bedrock)"},
+        {"id": "bedrock/meta.llama3-1-405b-instruct-v1:0", "name": "Llama 3.1 405B (Bedrock)"},
+        {"id": "bedrock/meta.llama3-1-70b-instruct-v1:0", "name": "Llama 3.1 70B (Bedrock)"},
+        {"id": "bedrock/amazon.nova-pro-v1:0", "name": "Amazon Nova Pro (Bedrock)"},
+        {"id": "bedrock/amazon.nova-lite-v1:0", "name": "Amazon Nova Lite (Bedrock)"},
+        {"id": "bedrock/mistral.mistral-large-2407-v1:0", "name": "Mistral Large (Bedrock)"},
+        {"id": "bedrock/cohere.command-r-plus-v1:0", "name": "Command R+ (Bedrock)"},
     ],
     "azure": [
         {"id": "azure/gpt-4o", "name": "GPT-4o (Azure)"},
+        {"id": "azure/gpt-4o-mini", "name": "GPT-4o Mini (Azure)"},
         {"id": "azure/gpt-4-turbo", "name": "GPT-4 Turbo (Azure)"},
+        {"id": "azure/o3-mini", "name": "o3-mini (Azure)"},
     ],
     "vertex": [
         {"id": "vertex_ai/gemini-2.0-flash", "name": "Gemini 2.0 Flash"},
         {"id": "vertex_ai/gemini-2.0-pro", "name": "Gemini 2.0 Pro"},
+        {"id": "vertex_ai/gemini-1.5-pro", "name": "Gemini 1.5 Pro"},
+        {"id": "vertex_ai/gemini-1.5-flash", "name": "Gemini 1.5 Flash"},
+        {"id": "vertex_ai/claude-sonnet-4@20250514", "name": "Claude Sonnet 4 (Vertex)"},
+        {"id": "vertex_ai/claude-opus-4@20250514", "name": "Claude Opus 4 (Vertex)"},
     ],
 }
 
 
-def _fetch_json(url: str, headers: dict[str, str] | None = None, timeout: float = 8) -> Any:
+def _fetch_json(url: str, headers: dict[str, str] | None = None, timeout: float = 10) -> Any:
     """Fetch JSON from a URL with optional headers."""
     req = Request(url)
     if headers:
@@ -72,7 +85,7 @@ def _fetch_json(url: str, headers: dict[str, str] | None = None, timeout: float 
 
 
 def _fetch_openrouter(api_key: str | None) -> list[dict]:
-    """Fetch models from OpenRouter. Works without a key too."""
+    """Fetch ALL models from OpenRouter. Returns the full catalog."""
     headers = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -80,27 +93,21 @@ def _fetch_openrouter(api_key: str | None) -> list[dict]:
     data = _fetch_json("https://openrouter.ai/api/v1/models", headers or None)
     models = data.get("data", [])
 
-    # Filter: only models that support tool use, sort by name
     results = []
     for m in models:
         mid = m.get("id", "")
         name = m.get("name", mid)
-        # Include popular providers, skip niche ones
-        if any(mid.startswith(p) for p in [
-            "anthropic/", "openai/", "google/", "meta-llama/",
-            "deepseek/", "mistralai/", "cohere/", "qwen/",
-        ]):
-            ctx = m.get("context_length", 0)
-            pricing = m.get("pricing", {})
-            prompt_cost = pricing.get("prompt", "0")
-            results.append({
-                "id": mid,
-                "name": name,
-                "context": ctx,
-                "cost": prompt_cost,
-            })
+        ctx = m.get("context_length", 0)
+        pricing = m.get("pricing", {})
+        prompt_cost = pricing.get("prompt", "0")
+        results.append({
+            "id": mid,
+            "name": name,
+            "context": ctx,
+            "cost": prompt_cost,
+        })
 
-    # Sort: anthropic first, then openai, then rest alphabetically
+    # Sort: anthropic first, then openai, then google, then rest alphabetically
     def sort_key(m):
         mid = m["id"]
         if mid.startswith("anthropic/"):
@@ -109,10 +116,16 @@ def _fetch_openrouter(api_key: str | None) -> list[dict]:
             return (1, mid)
         if mid.startswith("google/"):
             return (2, mid)
-        return (3, mid)
+        if mid.startswith("meta-llama/"):
+            return (3, mid)
+        if mid.startswith("deepseek/"):
+            return (4, mid)
+        if mid.startswith("mistralai/"):
+            return (5, mid)
+        return (6, mid)
 
     results.sort(key=sort_key)
-    return results[:50]  # Cap at 50 to keep UI manageable
+    return results
 
 
 def _fetch_anthropic(api_key: str) -> list[dict]:
@@ -156,11 +169,65 @@ def _fetch_openai(api_key: str) -> list[dict]:
     return results
 
 
-def fetch_models(provider: str, api_key: str | None = None) -> list[dict]:
+def _fetch_bedrock(aws_access_key: str | None, aws_secret_key: str | None, region: str | None) -> list[dict]:
+    """Try to list Bedrock foundation models via boto3."""
+    try:
+        import boto3  # type: ignore
+    except ImportError:
+        return _FALLBACKS.get("bedrock", [])
+
+    try:
+        kwargs: dict[str, Any] = {}
+        if region:
+            kwargs["region_name"] = region
+        if aws_access_key and aws_secret_key:
+            kwargs["aws_access_key_id"] = aws_access_key
+            kwargs["aws_secret_access_key"] = aws_secret_key
+
+        client = boto3.client("bedrock", **kwargs)
+        response = client.list_foundation_models()
+        models = response.get("modelSummaries", [])
+
+        results = []
+        for m in models:
+            mid = m.get("modelId", "")
+            name = m.get("modelName", mid)
+            provider = m.get("providerName", "")
+            # Only include models that support on-demand inference
+            inference_types = m.get("inferenceTypesSupported", [])
+            if "ON_DEMAND" not in inference_types:
+                continue
+            # Only include text models (input/output modalities include TEXT)
+            input_modalities = m.get("inputModalities", [])
+            output_modalities = m.get("outputModalities", [])
+            if "TEXT" not in input_modalities or "TEXT" not in output_modalities:
+                continue
+
+            results.append({
+                "id": f"bedrock/{mid}",
+                "name": f"{name} ({provider})" if provider else name,
+            })
+
+        # Sort by provider then model
+        results.sort(key=lambda m: m["id"])
+        return results if results else _FALLBACKS.get("bedrock", [])
+
+    except Exception:
+        return _FALLBACKS.get("bedrock", [])
+
+
+def fetch_models(provider: str, api_key: str | None = None, extra: dict | None = None) -> list[dict]:
     """Fetch available models for a provider. Uses cache + fallbacks.
+
+    Args:
+        provider: Provider key (openrouter, anthropic, etc.)
+        api_key: Optional API key override
+        extra: Optional extra config (aws_region, aws_secret_key, etc.)
 
     Returns list of {"id": str, "name": str, ...} dicts.
     """
+    extra = extra or {}
+
     # Check cache
     if provider in _cache:
         ts, cached = _cache[provider]
@@ -181,8 +248,13 @@ def fetch_models(provider: str, api_key: str | None = None) -> list[dict]:
             if not key:
                 return _FALLBACKS.get(provider, [])
             models = _fetch_openai(key)
+        elif provider == "bedrock":
+            aws_access = extra.get("aws_access_key_id") or os.environ.get("AWS_ACCESS_KEY_ID")
+            aws_secret = extra.get("aws_secret_access_key") or os.environ.get("AWS_SECRET_ACCESS_KEY")
+            aws_region = extra.get("aws_region") or os.environ.get("AWS_REGION_NAME") or os.environ.get("AWS_DEFAULT_REGION")
+            models = _fetch_bedrock(aws_access, aws_secret, aws_region)
         else:
-            # Bedrock, Azure, Vertex — no simple list endpoint
+            # Azure, Vertex — no simple list endpoint
             return _FALLBACKS.get(provider, [])
 
         if models:
