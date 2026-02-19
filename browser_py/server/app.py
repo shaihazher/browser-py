@@ -1825,7 +1825,7 @@ function updateTokenBar(usage) {
   const pctVal = Math.min(usage.usage_percent || 0, 100);
   fill.style.width = pctVal + '%';
   fill.className = 'fill ' + (usage.critical ? 'crit' : usage.warning ? 'warn' : 'ok');
-  label.textContent = `${(usage.total_tokens || 0).toLocaleString()} tokens`;
+  label.textContent = `${(usage.context_used || usage.total_tokens || 0).toLocaleString()} tokens`;
   pct.textContent = pctVal + '%';
 
   // Show warning banner
@@ -1834,7 +1834,7 @@ function updateTokenBar(usage) {
   if (usage.critical) {
     warn.style.display = 'block';
     warn.className = 'context-warning critical';
-    warnText.textContent = `Context ${pctVal}% full (${(usage.total_tokens||0).toLocaleString()} / ${(usage.context_limit||0).toLocaleString()}). Start a new chat for best results.`;
+    warnText.textContent = `Context ${pctVal}% full (${(usage.context_used||usage.total_tokens||0).toLocaleString()} / ${(usage.context_limit||0).toLocaleString()}). Start a new chat for best results.`;
   } else if (usage.warning) {
     warn.style.display = 'block';
     warn.className = 'context-warning';
@@ -2245,7 +2245,7 @@ function _probeText(data) {
   if (data.tool) text += ' — ' + data.tool + '(' + JSON.stringify(data.params || {}).slice(0, 100) + ')';
   if (data.iteration) text += ' [iteration ' + data.iteration + ']';
   if (data.elapsed_seconds) text += ' (' + data.elapsed_seconds + 's ago)';
-  if (data.token_usage) text += '\\nTokens: ' + (data.token_usage.total_tokens || 0).toLocaleString() +
+  if (data.token_usage) text += '\\nContext: ' + (data.token_usage.context_used || data.token_usage.total_tokens || 0).toLocaleString() +
     ' / ' + (data.token_usage.context_limit || 0).toLocaleString() +
     ' (' + (data.token_usage.usage_percent || 0) + '%)';
   return text;

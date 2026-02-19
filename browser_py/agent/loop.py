@@ -605,17 +605,24 @@ class Agent:
         return list(self.messages)
 
     def get_token_usage(self) -> dict[str, Any]:
-        """Get current token usage stats with context limit info."""
+        """Get current token usage stats with context limit info.
+
+        Uses _last_prompt_tokens (actual context window from last LLM call)
+        for percentage/warnings, not cumulative totals.
+        """
         from browser_py.agent.sessions import get_context_limit
 
         model = get_model()
         context_limit = get_context_limit(model)
-        usage_pct = (self.total_tokens / context_limit * 100) if context_limit else 0
+        # _last_prompt_tokens = actual context window size (what matters)
+        context_used = self._last_prompt_tokens
+        usage_pct = (context_used / context_limit * 100) if context_limit else 0
 
         return {
-            "total_tokens": self.total_tokens,
-            "prompt_tokens": self.prompt_tokens,
-            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,  # cumulative (for cost tracking)
+            "prompt_tokens": self.prompt_tokens,  # cumulative
+            "completion_tokens": self.completion_tokens,  # cumulative
+            "context_used": context_used,  # actual context window usage
             "context_limit": context_limit,
             "usage_percent": round(usage_pct, 1),
             "warning": usage_pct >= 75,
