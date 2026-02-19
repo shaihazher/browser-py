@@ -253,7 +253,7 @@ async def update_config(body: dict) -> JSONResponse:
 
 @app.get("/api/providers")
 async def list_providers() -> JSONResponse:
-    """List available providers with model suggestions."""
+    """List available providers with metadata (no models — use /api/models)."""
     from browser_py.agent.config import PROVIDERS
     result = {}
     for key, info in PROVIDERS.items():
@@ -263,45 +263,18 @@ async def list_providers() -> JSONResponse:
             "note": info.get("note", ""),
             "is_oauth": info.get("is_oauth", False),
         }
-    # Add suggested models per provider
-    result["openrouter"]["models"] = [
-        "anthropic/claude-sonnet-4-20250514",
-        "anthropic/claude-opus-4-20250514",
-        "anthropic/claude-haiku-4-5-20251212",
-        "openai/gpt-4o",
-        "openai/o3-mini",
-        "google/gemini-2.0-flash-001",
-        "deepseek/deepseek-chat",
-    ]
-    result["anthropic"]["models"] = [
-        "claude-sonnet-4-20250514",
-        "claude-opus-4-20250514",
-        "claude-haiku-4-5-20251212",
-    ]
-    result["claude_max"]["models"] = [
-        "claude-sonnet-4-20250514",
-        "claude-opus-4-20250514",
-        "claude-haiku-4-5-20251212",
-    ]
-    result["openai"]["models"] = [
-        "gpt-4o",
-        "gpt-4o-mini",
-        "o3-mini",
-        "gpt-4-turbo",
-    ]
-    result["bedrock"]["models"] = [
-        "bedrock/anthropic.claude-sonnet-4-20250514-v1:0",
-        "bedrock/anthropic.claude-haiku-4-5-20251212-v1:0",
-    ]
-    result["azure"]["models"] = [
-        "azure/gpt-4o",
-        "azure/gpt-4-turbo",
-    ]
-    result["vertex"]["models"] = [
-        "vertex_ai/gemini-2.0-flash",
-        "vertex_ai/gemini-2.0-pro",
-    ]
     return JSONResponse(result)
+
+
+@app.get("/api/models/{provider}")
+async def get_models(provider: str, api_key: str | None = None) -> JSONResponse:
+    """Fetch available models for a provider (live from API, cached 10min)."""
+    from browser_py.agent.models import fetch_models
+    import asyncio
+
+    loop = asyncio.get_event_loop()
+    models = await loop.run_in_executor(None, fetch_models, provider, api_key)
+    return JSONResponse({"models": models})
 
 
 @app.post("/api/setup")
@@ -974,17 +947,9 @@ async function loadSetupProfiles() {
   }
 }
 
-function onProviderChange() {
+async function onProviderChange() {
   const p = document.getElementById('setup-provider').value;
   const info = providers[p] || {};
-  const models = info.models || [];
-
-  // Model dropdown
-  const msel = document.getElementById('setup-model');
-  msel.innerHTML = models.map(m => `<option value="${m}">${m}</option>`).join('');
-  if (info.default_model && models.includes(info.default_model)) {
-    msel.value = info.default_model;
-  }
 
   // Key label & hint
   const keyLabel = document.getElementById('setup-key-label');
@@ -1005,7 +970,6 @@ function onProviderChange() {
     keyField.style.display = 'none';
     note.style.display = 'block';
     note.textContent = info.note;
-    return;
   } else {
     keyLabel.textContent = 'API Key';
     keyInput.placeholder = 'sk-...';
@@ -1013,7 +977,53 @@ function onProviderChange() {
     keyField.style.display = '';
   }
   note.style.display = info.note && p !== 'bedrock' && p !== 'vertex' ? 'block' : 'none';
-  note.textContent = info.note || '';
+  if (p !== 'bedrock' && p !== 'vertex') note.textContent = info.note || '';
+
+  // Fetch models live
+  await loadModelsForProvider(p, 'setup-model', info.default_model);
+}
+
+// Debounced key input → refresh models
+let _keyTimer;
+document.getElementById('setup-key')?.addEventListener('input', function() {
+  clearTimeout(_keyTimer);
+  _keyTimer = setTimeout(async () => {
+    const p = document.getElementById('setup-provider').value;
+    const key = this.value.trim();
+    if (key.length > 10 && p) {
+      await loadModelsForProvider(p, 'setup-model', providers[p]?.default_model, key);
+    }
+  }, 800);
+});
+
+async function loadModelsForProvider(provider, selectId, defaultModel, apiKey) {
+  const msel = document.getElementById(selectId);
+  msel.innerHTML = '<option value="">Loading models...</option>';
+
+  try {
+    let url = '/api/models/' + provider;
+    if (apiKey) url += '?api_key=' + encodeURIComponent(apiKey);
+    const res = await fetch(url);
+    const data = await res.json();
+    const models = data.models || [];
+
+    if (!models.length) {
+      msel.innerHTML = '<option value="">No models found</option>';
+      return;
+    }
+
+    msel.innerHTML = models.map(m => {
+      const label = m.name !== m.id ? `${m.name} (${m.id})` : m.id;
+      return `<option value="${m.id}">${label}</option>`;
+    }).join('');
+
+    // Select default
+    if (defaultModel && [...msel.options].some(o => o.value === defaultModel)) {
+      msel.value = defaultModel;
+    }
+  } catch(e) {
+    msel.innerHTML = '<option value="">Failed to load models</option>';
+  }
 }
 
 async function setupCreateProfile() {
@@ -1238,15 +1248,16 @@ async function loadSettingsPage() {
   ).join('');
   onCfgProviderChange();
 
-  // Model
+  // Model — fetch live
+  await loadModelsForProvider(cfg.provider, 'cfg-model-select', cfg.model);
   const msel = document.getElementById('cfg-model-select');
-  const info = providers[cfg.provider] || {};
-  const models = info.models || [];
-  msel.innerHTML = models.map(m =>
-    `<option value="${m}" ${m === cfg.model ? 'selected' : ''}>${m}</option>`
-  ).join('');
-  document.getElementById('cfg-model').value =
-    models.includes(cfg.model) ? '' : (cfg.model || '');
+  // If current model is in the list, clear custom input; otherwise put it there
+  if ([...msel.options].some(o => o.value === cfg.model)) {
+    msel.value = cfg.model;
+    document.getElementById('cfg-model').value = '';
+  } else {
+    document.getElementById('cfg-model').value = cfg.model || '';
+  }
 
   // Workspace
   document.getElementById('cfg-workspace').value = cfg.workspace || '';
@@ -1266,15 +1277,9 @@ async function loadSettingsPage() {
     cfg.provider === 'azure' ? 'block' : 'none';
 }
 
-function onCfgProviderChange() {
+async function onCfgProviderChange() {
   const p = document.getElementById('cfg-provider').value;
   const info = providers[p] || {};
-
-  // Update model dropdown
-  const msel = document.getElementById('cfg-model-select');
-  const models = info.models || [];
-  msel.innerHTML = models.map(m => `<option value="${m}">${m}</option>`).join('');
-  if (info.default_model) msel.value = info.default_model;
 
   // Key field label
   const keyLabel = document.getElementById('cfg-key-label');
@@ -1285,6 +1290,9 @@ function onCfgProviderChange() {
   keyField.style.display = (p === 'bedrock' || p === 'vertex') ? 'none' : '';
 
   document.getElementById('cfg-azure-fields').style.display = p === 'azure' ? 'block' : 'none';
+
+  // Fetch models live
+  await loadModelsForProvider(p, 'cfg-model-select', info.default_model);
 }
 
 async function saveSettings() {
