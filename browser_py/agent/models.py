@@ -85,7 +85,11 @@ def _fetch_json(url: str, headers: dict[str, str] | None = None, timeout: float 
 
 
 def _fetch_openrouter(api_key: str | None) -> list[dict]:
-    """Fetch ALL models from OpenRouter. Returns the full catalog."""
+    """Fetch ALL models from OpenRouter. Returns the full catalog.
+
+    Includes tool-use capability info from the API's supported_parameters.
+    Models that support tool use are marked with supports_tool_use=True.
+    """
     headers = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -100,11 +104,22 @@ def _fetch_openrouter(api_key: str | None) -> list[dict]:
         ctx = m.get("context_length", 0)
         pricing = m.get("pricing", {})
         prompt_cost = pricing.get("prompt", "0")
+
+        # Check tool-use support from OpenRouter's API metadata
+        supported_params = m.get("supported_parameters", [])
+        supports_tools = "tools" in supported_params or "tool_choice" in supported_params
+
+        # Meta-routers (openrouter/auto, openrouter/free) don't list
+        # supported_parameters — mark them specially
+        is_meta = mid.startswith("openrouter/")
+
         results.append({
             "id": mid,
             "name": name,
             "context": ctx,
             "cost": prompt_cost,
+            "supports_tool_use": supports_tools,
+            "is_meta_router": is_meta,
         })
 
     # Sort: anthropic first, then openai, then google, then rest alphabetically
@@ -216,13 +231,19 @@ def _fetch_bedrock(aws_access_key: str | None, aws_secret_key: str | None, regio
         return _FALLBACKS.get("bedrock", [])
 
 
-def fetch_models(provider: str, api_key: str | None = None, extra: dict | None = None) -> list[dict]:
+def fetch_models(
+    provider: str,
+    api_key: str | None = None,
+    extra: dict | None = None,
+    tool_use_only: bool = False,
+) -> list[dict]:
     """Fetch available models for a provider. Uses cache + fallbacks.
 
     Args:
         provider: Provider key (openrouter, anthropic, etc.)
         api_key: Optional API key override
         extra: Optional extra config (aws_region, aws_secret_key, etc.)
+        tool_use_only: If True, filter to models that support tool use (OpenRouter only)
 
     Returns list of {"id": str, "name": str, ...} dicts.
     """
@@ -259,6 +280,14 @@ def fetch_models(provider: str, api_key: str | None = None, extra: dict | None =
 
         if models:
             _cache[provider] = (time.monotonic(), models)
+
+            # Filter for tool-use support if requested
+            if tool_use_only and provider == "openrouter":
+                models = [
+                    m for m in models
+                    if m.get("supports_tool_use") or m.get("is_meta_router")
+                ]
+
             return models
 
     except (URLError, OSError, json.JSONDecodeError, KeyError, TypeError):

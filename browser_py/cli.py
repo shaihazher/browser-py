@@ -260,6 +260,7 @@ def print_main_help() -> None:
             [
                 ("setup", "Configure LLM provider, workspace, browser"),
                 ("agent [message]", "Chat with the agent (interactive or one-shot)"),
+                ("research <query>", "Deep research with 5 sub-agents"),
                 ("serve [--port 8321]", "Start the web UI"),
             ],
         ),
@@ -714,6 +715,45 @@ def run_agent(args: list[str]) -> None:
         print(response)
 
 
+def run_research_cli(args: list[str]) -> None:
+    """Run deep research from the CLI."""
+    from browser_py.agent.config import is_configured
+
+    if not is_configured():
+        print(_yellow("Agent not configured. Run 'bpy setup' first."))
+        return
+
+    if not args:
+        print(_bold("Usage:") + " bpy research <query>")
+        print(_dim("Example: bpy research 'What are the best Python web frameworks in 2025?'"))
+        return
+
+    query = " ".join(args)
+    print(_bold(f"🔬 Deep Research: {query}\n"))
+    print(_dim(f"Deploying 5 sub-agents to research this topic...\n"))
+
+    def on_progress(stage: str, message: str) -> None:
+        icon = "✅" if stage in ("planned", "researched", "complete", "done") else "⏳"
+        print(f"  {icon} {message}")
+
+    from browser_py.agent.research import run_research
+    from browser_py.agent.config import get_agent_config
+
+    cfg = get_agent_config()
+    result = run_research(
+        query=query,
+        on_progress=on_progress,
+        browser_profile=cfg.get("browser_profile"),
+    )
+
+    print(f"\n{_green('Report saved to:')} {result['report_path']}")
+    print(f"{_dim(f'Duration: {result[\"duration_seconds\"]:.0f}s')}")
+    print(f"\n{_bold('--- Report Preview ---')}\n")
+    print(result["report"][:3000])
+    if len(result["report"]) > 3000:
+        print(_dim(f"\n... ({len(result['report'])} chars total — see full report at path above)"))
+
+
 def run_serve(args: list[str]) -> None:
     """Start the web UI server."""
     # Don't require CLI setup — the web UI has its own setup flow
@@ -767,6 +807,10 @@ def main() -> None:
 
         if cmd == "agent":
             run_agent(cmd_args)
+            return
+
+        if cmd == "research":
+            run_research_cli(cmd_args)
             return
 
         if cmd == "serve":

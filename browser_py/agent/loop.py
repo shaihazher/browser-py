@@ -77,6 +77,7 @@ class Agent:
         browser_profile: Default browser profile to use.
         on_tool_call: Callback when a tool is called (name, params, result).
         on_message: Callback when the LLM produces text.
+        on_token_update: Callback when token usage updates (usage_dict).
         max_iterations: Safety limit on tool call loops (default: 50).
     """
 
@@ -87,6 +88,7 @@ class Agent:
         on_tool_call: Callable[[str, dict, str], None] | None = None,
         on_message: Callable[[str], None] | None = None,
         on_job_trigger: Callable[[dict], None] | None = None,
+        on_token_update: Callable[[dict], None] | None = None,
         max_iterations: int = 50,
     ) -> None:
         self.workspace = workspace or get_workspace()
@@ -94,6 +96,7 @@ class Agent:
         self.max_iterations = max_iterations
         self.on_tool_call = on_tool_call
         self.on_message = on_message
+        self.on_token_update = on_token_update
 
         # Initialize tools — browser downloads go to workspace/downloads
         downloads_dir = str(self.workspace / "downloads")
@@ -125,6 +128,14 @@ class Agent:
         # Conversation history
         self.messages: list[dict[str, Any]] = []
         self._system_prompt = SYSTEM_PROMPT.format(workspace=self.workspace)
+
+        # Token tracking
+        self.total_tokens = 0
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+
+        # Session management
+        self.session_id: str | None = None
 
     def _setup_litellm(self) -> None:
         """Configure LiteLLM with the right provider credentials."""
@@ -196,6 +207,16 @@ class Agent:
             kwargs["model"] = f"openai/{model}"
 
         response = litellm.completion(**kwargs)
+
+        # Track token usage
+        usage = getattr(response, "usage", None)
+        if usage:
+            self.prompt_tokens += getattr(usage, "prompt_tokens", 0) or 0
+            self.completion_tokens += getattr(usage, "completion_tokens", 0) or 0
+            self.total_tokens = self.prompt_tokens + self.completion_tokens
+
+            if self.on_token_update:
+                self.on_token_update(self.get_token_usage())
 
         return response
 
@@ -353,9 +374,71 @@ class Agent:
         return text.strip()
 
     def reset(self) -> None:
-        """Clear conversation history."""
+        """Clear conversation history and token counts."""
         self.messages.clear()
+        self.total_tokens = 0
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.session_id = None
 
     def get_history(self) -> list[dict[str, Any]]:
         """Get conversation history."""
         return list(self.messages)
+
+    def get_token_usage(self) -> dict[str, Any]:
+        """Get current token usage stats with context limit info."""
+        from browser_py.agent.sessions import get_context_limit
+
+        model = get_model()
+        context_limit = get_context_limit(model)
+        usage_pct = (self.total_tokens / context_limit * 100) if context_limit else 0
+
+        return {
+            "total_tokens": self.total_tokens,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "context_limit": context_limit,
+            "usage_percent": round(usage_pct, 1),
+            "warning": usage_pct >= 75,
+            "critical": usage_pct >= 90,
+            "model": model,
+        }
+
+    def load_session(self, session_id: str) -> bool:
+        """Load a saved session's messages into the agent.
+
+        Returns True if loaded successfully.
+        """
+        from browser_py.agent.sessions import load_session as _load
+
+        session = _load(session_id)
+        if not session:
+            return False
+
+        self.messages = session.get("messages", [])
+        self.total_tokens = session.get("total_tokens", 0)
+        self.prompt_tokens = session.get("prompt_tokens", 0)
+        self.completion_tokens = session.get("completion_tokens", 0)
+        self.session_id = session_id
+        return True
+
+    def save_session(self, title: str | None = None) -> dict[str, Any]:
+        """Save current conversation as a session.
+
+        Returns session metadata.
+        """
+        from browser_py.agent.sessions import save_session, generate_session_id
+
+        if not self.session_id:
+            self.session_id = generate_session_id()
+
+        return save_session(
+            session_id=self.session_id,
+            messages=self.messages,
+            model=get_model(),
+            provider=get_provider(),
+            total_tokens=self.total_tokens,
+            prompt_tokens=self.prompt_tokens,
+            completion_tokens=self.completion_tokens,
+            title=title,
+        )

@@ -28,6 +28,12 @@ _agent_lock = threading.Lock()
 _ws_clients: list[WebSocket] = []
 
 
+def _on_token_update(usage: dict) -> None:
+    """Broadcast token usage updates to WebSocket clients."""
+    msg = json.dumps({"type": "token_update", **usage})
+    _broadcast(msg)
+
+
 def _get_agent() -> Agent:
     global _agent
     if _agent is None:
@@ -39,6 +45,7 @@ def _get_agent() -> Agent:
             on_tool_call=_on_tool_call,
             on_message=_on_message,
             on_job_trigger=_on_job_change,
+            on_token_update=_on_token_update,
         )
         if not cfg.get("shell_enabled", True):
             _agent._shell.enabled = False
@@ -157,6 +164,165 @@ async def config() -> JSONResponse:
     safe["provider_fields"] = provider_fields
 
     return JSONResponse(safe)
+
+
+
+# ── Session endpoints ──
+
+
+@app.get("/api/sessions")
+async def list_sessions_api() -> JSONResponse:
+    """List saved chat sessions."""
+    from browser_py.agent.sessions import list_sessions
+    return JSONResponse({"sessions": list_sessions()})
+
+
+@app.post("/api/sessions/save")
+async def save_session_api(body: dict) -> JSONResponse:
+    """Save the current chat session."""
+    try:
+        agent = _get_agent()
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    title = body.get("title")
+    meta = agent.save_session(title=title)
+    return JSONResponse({"ok": True, "session": meta})
+
+
+@app.post("/api/sessions/load")
+async def load_session_api(body: dict) -> JSONResponse:
+    """Load a saved session into the agent."""
+    session_id = body.get("session_id")
+    if not session_id:
+        return JSONResponse({"error": "session_id required"}, status_code=400)
+
+    try:
+        agent = _get_agent()
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    if agent.load_session(session_id):
+        return JSONResponse({
+            "ok": True,
+            "message_count": len(agent.messages),
+            "token_usage": agent.get_token_usage(),
+        })
+    return JSONResponse({"error": "Session not found"}, status_code=404)
+
+
+@app.delete("/api/sessions/{session_id}")
+async def delete_session_api(session_id: str) -> JSONResponse:
+    """Delete a saved session."""
+    from browser_py.agent.sessions import delete_session
+    if delete_session(session_id):
+        return JSONResponse({"ok": True})
+    return JSONResponse({"error": "Session not found"}, status_code=404)
+
+
+@app.get("/api/sessions/{session_id}/export")
+async def export_session_api(session_id: str) -> JSONResponse:
+    """Export a session as markdown."""
+    from browser_py.agent.sessions import export_session_markdown
+    md = export_session_markdown(session_id)
+    if md:
+        return JSONResponse({"markdown": md})
+    return JSONResponse({"error": "Session not found"}, status_code=404)
+
+
+@app.get("/api/tokens")
+async def get_tokens() -> JSONResponse:
+    """Get current token usage for the active session."""
+    try:
+        agent = _get_agent()
+        return JSONResponse(agent.get_token_usage())
+    except RuntimeError:
+        return JSONResponse({
+            "total_tokens": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "context_limit": 128000,
+            "usage_percent": 0,
+            "warning": False,
+            "critical": False,
+            "model": "",
+        })
+
+
+# ── Research endpoint ──
+
+
+@app.post("/api/research")
+async def start_research(body: dict) -> JSONResponse:
+    """Start a deep research session (runs in background, streams via WS)."""
+    query = body.get("query", "")
+    if not query:
+        return JSONResponse({"error": "query required"}, status_code=400)
+
+    num_agents = body.get("num_agents", 5)
+    cfg = get_agent_config()
+
+    def on_progress(stage: str, message: str) -> None:
+        msg = json.dumps({"type": "research_progress", "stage": stage, "message": message})
+        _broadcast(msg)
+
+    import threading
+
+    def _run() -> None:
+        from browser_py.agent.research import run_research
+        try:
+            result = run_research(
+                query=query,
+                on_progress=on_progress,
+                browser_profile=cfg.get("browser_profile"),
+                num_agents=num_agents,
+            )
+            msg = json.dumps({
+                "type": "research_complete",
+                "report_path": result["report_path"],
+                "report": result["report"][:50000],
+                "duration": result["duration_seconds"],
+                "subtopics": result["subtopics"],
+            })
+            _broadcast(msg)
+        except Exception as e:
+            msg = json.dumps({
+                "type": "research_error",
+                "error": str(e),
+            })
+            _broadcast(msg)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return JSONResponse({"ok": True, "message": "Research started"})
+
+
+# ── Validate API key ──
+
+
+@app.post("/api/validate-key")
+async def validate_key(body: dict) -> JSONResponse:
+    """Validate an API key by making a minimal API call."""
+    provider = body.get("provider", "")
+    api_key = body.get("api_key", "")
+
+    if not provider or not api_key:
+        return JSONResponse({"valid": False, "error": "provider and api_key required"})
+
+    import asyncio
+    loop = asyncio.get_event_loop()
+
+    def _validate() -> dict:
+        try:
+            from browser_py.agent.models import fetch_models
+            models = fetch_models(provider, api_key=api_key)
+            if models:
+                return {"valid": True, "model_count": len(models)}
+            return {"valid": False, "error": "No models returned"}
+        except Exception as e:
+            return {"valid": False, "error": str(e)}
+
+    result = await loop.run_in_executor(None, _validate)
+    return JSONResponse(result)
 
 
 @app.get("/api/jobs")
@@ -289,10 +455,17 @@ async def list_providers() -> JSONResponse:
 
 
 @app.get("/api/models/{provider}")
-async def get_models(provider: str, api_key: str | None = None, q: str | None = None) -> JSONResponse:
+async def get_models(
+    provider: str,
+    api_key: str | None = None,
+    q: str | None = None,
+    tool_use_only: bool = False,
+) -> JSONResponse:
     """Fetch available models for a provider (live from API, cached 10min).
 
-    Optional query param `q` filters models client-side (search).
+    Optional query params:
+    - q: filter models by search string
+    - tool_use_only: only return models that support tool use
     """
     from browser_py.agent.models import fetch_models
     import asyncio
@@ -306,7 +479,9 @@ async def get_models(provider: str, api_key: str | None = None, q: str | None = 
             extra[key] = pcfg[key]
 
     loop = asyncio.get_event_loop()
-    models = await loop.run_in_executor(None, fetch_models, provider, api_key, extra)
+    models = await loop.run_in_executor(
+        None, lambda: fetch_models(provider, api_key, extra, tool_use_only=tool_use_only)
+    )
 
     # Server-side search filter
     if q:
@@ -410,6 +585,20 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                     }))
                     continue
 
+                # Check context limit before sending
+                usage = agent.get_token_usage()
+                if usage["critical"]:
+                    await ws.send_text(json.dumps({
+                        "type": "context_warning",
+                        "level": "critical",
+                        "message": (
+                            f"⚠️ Context is {usage['usage_percent']}% full "
+                            f"({usage['total_tokens']:,} / {usage['context_limit']:,} tokens). "
+                            "Consider starting a new chat to avoid degraded responses."
+                        ),
+                        "usage": usage,
+                    }))
+
                 await ws.send_text(json.dumps({"type": "thinking"}))
 
                 loop = asyncio.get_event_loop()
@@ -417,13 +606,22 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                     None, agent.chat, msg.get("message", "")
                 )
 
+                # Auto-save session after each exchange
+                session_meta = await loop.run_in_executor(None, agent.save_session)
+
                 await ws.send_text(json.dumps({
                     "type": "response",
                     "content": result,
+                    "token_usage": agent.get_token_usage(),
+                    "session_id": agent.session_id,
                 }))
 
             elif msg.get("type") == "reset":
                 agent = _get_agent()
+                # Save current session before reset (if it has messages)
+                if agent.messages:
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, agent.save_session)
                 agent.reset()
                 await ws.send_text(json.dumps({"type": "reset_ok"}))
 
@@ -615,7 +813,7 @@ _FALLBACK_HTML = """\
     flex-direction: column; background: var(--surface); flex-shrink: 0; }
   #sidebar .logo { padding: 16px; font-size: 15px; font-weight: 700;
     border-bottom: 1px solid var(--border); }
-  #sidebar nav { flex: 1; padding: 8px 0; }
+  #sidebar nav { flex: 1; padding: 8px 0; overflow-y: auto; }
   #sidebar nav a { display: flex; align-items: center; gap: 8px; padding: 8px 16px;
     color: var(--text-dim); text-decoration: none; font-size: 13px; cursor: pointer;
     border-left: 3px solid transparent; }
@@ -624,6 +822,27 @@ _FALLBACK_HTML = """\
     background: rgba(88,166,255,0.08); }
   #sidebar .version { padding: 12px 16px; font-size: 11px; color: var(--text-dim);
     border-top: 1px solid var(--border); }
+
+  /* Sessions list in sidebar */
+  #sidebar .sessions-section { border-top: 1px solid var(--border); padding: 8px 0; }
+  #sidebar .sessions-section .section-title { padding: 4px 16px; font-size: 11px;
+    color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; }
+  #sidebar .session-item { display: block; padding: 6px 16px; font-size: 12px;
+    color: var(--text-dim); cursor: pointer; text-decoration: none;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    border-left: 3px solid transparent; }
+  #sidebar .session-item:hover { color: var(--text); background: rgba(255,255,255,0.04); }
+  #sidebar .session-item.active { color: var(--accent); border-left-color: var(--accent); }
+
+  /* Token usage bar */
+  .token-bar-wrap { padding: 8px 16px; border-top: 1px solid var(--border); }
+  .token-bar { height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; }
+  .token-bar .fill { height: 100%; border-radius: 2px; transition: width 0.3s; }
+  .token-bar .fill.ok { background: var(--accent); }
+  .token-bar .fill.warn { background: #d29922; }
+  .token-bar .fill.crit { background: var(--danger); }
+  .token-bar-label { font-size: 10px; color: var(--text-dim); margin-top: 2px;
+    display: flex; justify-content: space-between; }
 
   /* Main area */
   #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
@@ -705,6 +924,51 @@ _FALLBACK_HTML = """\
   .key-status.configured { color: var(--success); }
   .key-status.missing { color: var(--text-dim); }
 
+  /* Research panel */
+  .research-panel { background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px; margin: 12px 20px; }
+  .research-panel h3 { font-size: 14px; margin-bottom: 8px; }
+  .research-panel .progress-steps { margin: 12px 0; }
+  .research-panel .step { padding: 6px 0; font-size: 13px; color: var(--text-dim);
+    display: flex; align-items: center; gap: 8px; }
+  .research-panel .step.active { color: var(--accent); }
+  .research-panel .step.done { color: var(--success); }
+  .research-report { background: var(--bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px; margin-top: 12px; max-height: 60vh;
+    overflow-y: auto; font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
+
+  /* Setup wizard steps */
+  .wizard-steps { display: flex; gap: 4px; margin-bottom: 20px; }
+  .wizard-step { flex: 1; height: 4px; border-radius: 2px; background: var(--border); }
+  .wizard-step.done { background: var(--success); }
+  .wizard-step.current { background: var(--accent); }
+  .wizard-section { display: none; }
+  .wizard-section.active { display: block; }
+  .wizard-nav { display: flex; gap: 8px; margin-top: 16px; }
+  .wizard-nav .btn { flex: 1; }
+  .validation-status { font-size: 12px; margin-top: 8px; padding: 8px 12px;
+    border-radius: 6px; display: none; }
+  .validation-status.checking { display: block; background: rgba(88,166,255,0.1);
+    color: var(--accent); }
+  .validation-status.valid { display: block; background: rgba(63,185,80,0.1);
+    color: var(--success); }
+  .validation-status.invalid { display: block; background: rgba(248,81,73,0.1);
+    color: var(--danger); }
+
+  /* Tool-use filter toggle */
+  .filter-toggle { display: flex; align-items: center; gap: 6px; margin: 8px 0;
+    font-size: 12px; color: var(--text-dim); }
+  .filter-toggle input { width: auto; }
+
+  /* Context warning banner */
+  .context-warning { background: rgba(210,153,34,0.15); border: 1px solid rgba(210,153,34,0.3);
+    border-radius: 8px; padding: 10px 14px; margin: 8px 20px; font-size: 13px;
+    color: #d29922; display: none; }
+  .context-warning.critical { background: rgba(248,81,73,0.15);
+    border-color: rgba(248,81,73,0.3); color: var(--danger); }
+  .context-warning .dismiss { float: right; cursor: pointer; opacity: 0.7; }
+  .context-warning .dismiss:hover { opacity: 1; }
+
   /* Searchable model picker */
   .model-search-wrap { position: relative; }
   .model-search-wrap input { width: 100%; }
@@ -738,10 +1002,22 @@ _FALLBACK_HTML = """\
   <div class="logo">🌐 browser-py</div>
   <nav>
     <a class="active" data-page="chat" onclick="showPage('chat')">💬 Chat</a>
+    <a data-page="research" onclick="showPage('research')">🔬 Research</a>
     <a data-page="profiles" onclick="showPage('profiles')">🌍 Browser Profiles</a>
     <a data-page="jobs" onclick="showPage('jobs')">⏰ Scheduled Jobs</a>
     <a data-page="settings" onclick="showPage('settings')">⚙️ Settings</a>
+    <div class="sessions-section" id="sessions-section">
+      <div class="section-title">Recent Chats</div>
+      <div id="sessions-list"></div>
+    </div>
   </nav>
+  <div class="token-bar-wrap" id="token-bar-wrap" style="display:none">
+    <div class="token-bar"><div class="fill ok" id="token-fill" style="width:0%"></div></div>
+    <div class="token-bar-label">
+      <span id="token-label">0 tokens</span>
+      <span id="token-pct">0%</span>
+    </div>
+  </div>
   <div class="version" id="version-info">browser-py</div>
 </div>
 
@@ -752,66 +1028,108 @@ _FALLBACK_HTML = """\
     <div class="page-content">
       <div class="card">
         <h3>Welcome to browser-py</h3>
-        <p>Let's configure your AI agent. This takes about 30 seconds.</p>
+        <p>Let's configure your AI agent step by step.</p>
       </div>
 
-      <div class="card">
-        <h3>1. LLM Provider</h3>
-        <div class="field">
-          <label>Provider</label>
-          <select id="setup-provider" onchange="onSetupProviderChange()">
-            <option value="">— Select —</option>
-          </select>
+      <div class="wizard-steps" id="wizard-steps">
+        <div class="wizard-step current" data-step="1"></div>
+        <div class="wizard-step" data-step="2"></div>
+        <div class="wizard-step" data-step="3"></div>
+        <div class="wizard-step" data-step="4"></div>
+        <div class="wizard-step" data-step="5"></div>
+      </div>
+
+      <!-- Step 1: Provider + Key -->
+      <div class="wizard-section active" id="wizard-1">
+        <div class="card">
+          <h3>Step 1: LLM Provider &amp; API Key</h3>
+          <div class="field">
+            <label>Provider</label>
+            <select id="setup-provider" onchange="onSetupProviderChange()">
+              <option value="">— Select —</option>
+            </select>
+          </div>
+          <div id="setup-provider-note" style="font-size:12px;color:var(--text-dim);margin-bottom:12px;display:none"></div>
+          <div id="setup-key-section"></div>
+          <div id="setup-provider-fields"></div>
+          <div class="validation-status" id="key-validation"></div>
         </div>
-        <div id="setup-provider-note" style="font-size:12px;color:var(--text-dim);margin-bottom:12px;display:none"></div>
-        <!-- Simple key field for single-key providers -->
-        <div id="setup-key-section"></div>
-        <!-- Dynamic fields for multi-field providers (Bedrock, Azure, Vertex) -->
-        <div id="setup-provider-fields"></div>
-      </div>
-
-      <div class="card">
-        <h3>2. Model</h3>
-        <div id="setup-model-picker"></div>
-        <div class="field" style="margin-top:8px">
-          <label>Or type a custom model name</label>
-          <input type="text" id="setup-model-custom" placeholder="Leave empty to use selection above">
-        </div>
-      </div>
-
-      <div class="card">
-        <h3>3. Workspace Directory</h3>
-        <p>All file operations are sandboxed to this directory.</p>
-        <div class="field">
-          <label>Path</label>
-          <input type="text" id="setup-workspace" placeholder="~/browser-py-workspace">
+        <div class="wizard-nav">
+          <button class="btn" onclick="wizardNext(1)" id="wizard-next-1">Next →</button>
         </div>
       </div>
 
-      <div class="card">
-        <h3>4. Browser Profile</h3>
-        <p>The browser profile the agent uses. Each profile keeps its own logins and cookies.</p>
-        <div class="field">
-          <label>Profile</label>
-          <select id="setup-browser-profile"></select>
+      <!-- Step 2: Model -->
+      <div class="wizard-section" id="wizard-2">
+        <div class="card">
+          <h3>Step 2: Choose a Model</h3>
+          <div class="filter-toggle">
+            <input type="checkbox" id="setup-tool-filter" checked onchange="onSetupToolFilterChange()">
+            <label for="setup-tool-filter" style="margin:0;text-transform:none">Only show models with tool-use support</label>
+          </div>
+          <div id="setup-model-picker"></div>
+          <div class="field" style="margin-top:8px">
+            <label>Or type a custom model name</label>
+            <input type="text" id="setup-model-custom" placeholder="Leave empty to use selection above">
+          </div>
         </div>
-        <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
-          <input type="text" id="setup-new-profile" placeholder="New profile name" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:6px 10px;color:var(--text);font-size:13px;flex:1">
-          <button class="btn secondary" onclick="setupCreateProfile()" style="white-space:nowrap">Create</button>
+        <div class="wizard-nav">
+          <button class="btn secondary" onclick="wizardBack(2)">← Back</button>
+          <button class="btn" onclick="wizardNext(2)">Next →</button>
         </div>
       </div>
 
-      <div class="card">
-        <h3>5. Permissions</h3>
-        <div class="field" style="display:flex;align-items:center;gap:8px">
-          <input type="checkbox" id="setup-shell" style="width:auto" checked>
-          <label for="setup-shell" style="margin:0;text-transform:none">Allow shell commands</label>
+      <!-- Step 3: Workspace -->
+      <div class="wizard-section" id="wizard-3">
+        <div class="card">
+          <h3>Step 3: Workspace Directory</h3>
+          <p>All file operations are sandboxed to this directory.</p>
+          <div class="field">
+            <label>Path</label>
+            <input type="text" id="setup-workspace" placeholder="~/browser-py-workspace">
+          </div>
+        </div>
+        <div class="wizard-nav">
+          <button class="btn secondary" onclick="wizardBack(3)">← Back</button>
+          <button class="btn" onclick="wizardNext(3)">Next →</button>
         </div>
       </div>
 
-      <button class="btn" onclick="submitSetup()" style="width:100%;padding:12px;font-size:15px" id="setup-submit">
-        Save &amp; Start
-      </button>
+      <!-- Step 4: Browser Profile -->
+      <div class="wizard-section" id="wizard-4">
+        <div class="card">
+          <h3>Step 4: Browser Profile</h3>
+          <p>Each profile keeps its own logins and cookies.</p>
+          <div class="field">
+            <label>Profile</label>
+            <select id="setup-browser-profile"></select>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
+            <input type="text" id="setup-new-profile" placeholder="New profile name" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:6px 10px;color:var(--text);font-size:13px;flex:1">
+            <button class="btn secondary" onclick="setupCreateProfile()" style="white-space:nowrap">Create</button>
+          </div>
+        </div>
+        <div class="wizard-nav">
+          <button class="btn secondary" onclick="wizardBack(4)">← Back</button>
+          <button class="btn" onclick="wizardNext(4)">Next →</button>
+        </div>
+      </div>
+
+      <!-- Step 5: Permissions + Finish -->
+      <div class="wizard-section" id="wizard-5">
+        <div class="card">
+          <h3>Step 5: Permissions</h3>
+          <div class="field" style="display:flex;align-items:center;gap:8px">
+            <input type="checkbox" id="setup-shell" style="width:auto" checked>
+            <label for="setup-shell" style="margin:0;text-transform:none">Allow shell commands</label>
+          </div>
+        </div>
+        <div class="wizard-nav">
+          <button class="btn secondary" onclick="wizardBack(5)">← Back</button>
+          <button class="btn" onclick="submitSetup()" id="setup-submit" style="flex:2">Save &amp; Start</button>
+        </div>
+      </div>
+
       <div id="setup-error" style="color:var(--danger);font-size:13px;margin-top:8px;display:none"></div>
     </div>
   </div>
@@ -823,11 +1141,47 @@ _FALLBACK_HTML = """\
       <button class="btn secondary" onclick="resetChat()" style="margin-left:auto">New Chat</button>
       <div class="status" id="status">Connecting...</div>
     </header>
+    <div class="context-warning" id="context-warning">
+      <span class="dismiss" onclick="this.parentElement.style.display='none'">✕</span>
+      <span id="context-warning-text"></span>
+    </div>
     <div id="chat-messages"></div>
     <div id="input-area">
       <textarea id="input" placeholder="What should I do?" rows="1"
         onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}"></textarea>
       <button id="send" onclick="send()">Send</button>
+    </div>
+  </div>
+
+  <!-- Research Page -->
+  <div class="page" id="page-research">
+    <header><h2>🔬 Deep Research</h2></header>
+    <div class="page-content">
+      <div class="card">
+        <h3>Research Query</h3>
+        <p>Enter a topic and the agent will deploy 5 sub-agents to research it from multiple angles, then compile a comprehensive report.</p>
+        <div class="field">
+          <label>What should I research?</label>
+          <textarea id="research-query" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-size:13px;width:100%;min-height:60px;resize:vertical;font-family:inherit" placeholder="e.g., What are the best strategies for SEO in 2025?"></textarea>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button class="btn" onclick="startResearch()" id="research-start">Start Research</button>
+          <span style="font-size:12px;color:var(--text-dim)">Uses 5 sequential sub-agents with browser access</span>
+        </div>
+      </div>
+      <div id="research-progress" style="display:none">
+        <div class="card">
+          <h3>Research Progress</h3>
+          <div class="progress-steps" id="research-steps"></div>
+        </div>
+      </div>
+      <div id="research-result" style="display:none">
+        <div class="card">
+          <h3>Research Report</h3>
+          <div style="font-size:12px;color:var(--text-dim);margin-bottom:8px" id="research-meta"></div>
+          <div class="research-report" id="research-report-content"></div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -1155,12 +1509,174 @@ async function init() {
   } else {
     connect();
     loadVersionInfo(currentCfg);
+    loadSessions();
   }
 }
 
 function loadVersionInfo(cfg) {
   document.getElementById('version-info').textContent =
     `${providers[cfg.provider]?.name || cfg.provider} · ${(cfg.model || '').split('/').pop() || ''}`;
+}
+
+// ── Sessions ──
+async function loadSessions() {
+  try {
+    const res = await fetch('/api/sessions');
+    const data = await res.json();
+    const el = document.getElementById('sessions-list');
+    const sessions = data.sessions || [];
+    if (!sessions.length) {
+      el.innerHTML = '<div style="padding:4px 16px;font-size:11px;color:var(--text-dim)">No saved chats</div>';
+      return;
+    }
+    el.innerHTML = sessions.slice(0, 10).map(s => {
+      const title = s.title || 'Untitled';
+      const active = _get_agent_session_id() === s.id ? ' active' : '';
+      return `<div class="session-item${active}" onclick="loadSession('${s.id}')" title="${title}">${title}</div>`;
+    }).join('');
+  } catch(e) {}
+}
+
+function _get_agent_session_id() {
+  return window._currentSessionId || '';
+}
+
+async function loadSession(id) {
+  const res = await fetch('/api/sessions/load', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ session_id: id })
+  });
+  const data = await res.json();
+  if (data.error) { alert(data.error); return; }
+
+  window._currentSessionId = id;
+
+  // Reload chat history
+  const hres = await fetch('/api/history');
+  const hdata = await hres.json();
+  const chatEl = document.getElementById('chat-messages');
+  chatEl.innerHTML = '';
+  (hdata.messages || []).forEach(m => {
+    if (m.role === 'user' && m.content) addMsg(m.content, 'user');
+    else if (m.role === 'assistant' && m.content) addMsg(m.content, 'agent');
+  });
+
+  updateTokenBar(data.token_usage);
+  loadSessions();
+  showPage('chat');
+}
+
+// ── Token Usage ──
+function updateTokenBar(usage) {
+  if (!usage) return;
+  const wrap = document.getElementById('token-bar-wrap');
+  const fill = document.getElementById('token-fill');
+  const label = document.getElementById('token-label');
+  const pct = document.getElementById('token-pct');
+
+  wrap.style.display = 'block';
+  const pctVal = Math.min(usage.usage_percent || 0, 100);
+  fill.style.width = pctVal + '%';
+  fill.className = 'fill ' + (usage.critical ? 'crit' : usage.warning ? 'warn' : 'ok');
+  label.textContent = `${(usage.total_tokens || 0).toLocaleString()} tokens`;
+  pct.textContent = pctVal + '%';
+
+  // Show warning banner
+  const warn = document.getElementById('context-warning');
+  const warnText = document.getElementById('context-warning-text');
+  if (usage.critical) {
+    warn.style.display = 'block';
+    warn.className = 'context-warning critical';
+    warnText.textContent = `Context ${pctVal}% full (${(usage.total_tokens||0).toLocaleString()} / ${(usage.context_limit||0).toLocaleString()}). Start a new chat for best results.`;
+  } else if (usage.warning) {
+    warn.style.display = 'block';
+    warn.className = 'context-warning';
+    warnText.textContent = `Context ${pctVal}% full. Consider starting a new chat soon.`;
+  } else {
+    warn.style.display = 'none';
+  }
+}
+
+// ── Setup Wizard ──
+let wizardStep = 1;
+function wizardNext(step) {
+  // Validation per step
+  if (step === 1) {
+    const p = document.getElementById('setup-provider').value;
+    if (!p) { showSetupError('Please select a provider.'); return; }
+  }
+  clearSetupError();
+  wizardStep = step + 1;
+  renderWizard();
+}
+function wizardBack(step) {
+  wizardStep = step - 1;
+  renderWizard();
+}
+function renderWizard() {
+  for (let i = 1; i <= 5; i++) {
+    const sec = document.getElementById('wizard-' + i);
+    sec.classList.toggle('active', i === wizardStep);
+    const stepEl = document.querySelector(`.wizard-step[data-step="${i}"]`);
+    stepEl.className = 'wizard-step' + (i < wizardStep ? ' done' : i === wizardStep ? ' current' : '');
+  }
+}
+function showSetupError(msg) {
+  const el = document.getElementById('setup-error');
+  el.textContent = msg; el.style.display = 'block';
+}
+function clearSetupError() {
+  document.getElementById('setup-error').style.display = 'none';
+}
+
+// Tool-use filter for setup
+function onSetupToolFilterChange() {
+  const p = document.getElementById('setup-provider').value;
+  if (p) reloadSetupModels(p);
+}
+async function reloadSetupModels(provider) {
+  const toolOnly = document.getElementById('setup-tool-filter')?.checked || false;
+  const info = providers[provider] || {};
+  setupModelPicker.setLoading();
+  try {
+    let url = '/api/models/' + provider;
+    const params = [];
+    if (toolOnly) params.push('tool_use_only=true');
+    if (params.length) url += '?' + params.join('&');
+    const res = await fetch(url);
+    const data = await res.json();
+    setupModelPicker.setModels(data.models || [], info.default_model);
+  } catch(e) {
+    setupModelPicker.setModels([], null);
+  }
+}
+
+// ── Research ──
+async function startResearch() {
+  const query = document.getElementById('research-query').value.trim();
+  if (!query) return;
+
+  const btn = document.getElementById('research-start');
+  btn.disabled = true;
+  btn.textContent = 'Researching...';
+
+  document.getElementById('research-progress').style.display = 'block';
+  document.getElementById('research-result').style.display = 'none';
+  document.getElementById('research-steps').innerHTML =
+    '<div class="step active">⏳ Starting research pipeline...</div>';
+
+  try {
+    await fetch('/api/research', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ query })
+    });
+    // Results come via WebSocket
+  } catch(e) {
+    document.getElementById('research-steps').innerHTML +=
+      `<div class="step" style="color:var(--danger)">❌ Error: ${e}</div>`;
+    btn.disabled = false;
+    btn.textContent = 'Start Research';
+  }
 }
 
 // ── Navigation ──
@@ -1174,6 +1690,7 @@ function showPage(name) {
   if (name === 'jobs') loadJobs();
   if (name === 'settings') loadSettingsPage();
   if (name === 'setup') initSetupPage();
+  if (name === 'chat') loadSessions();
 }
 
 // ── Setup Page ──
@@ -1258,8 +1775,8 @@ async function onSetupProviderChange() {
     document.getElementById('setup-key-section').innerHTML = '';
   }
 
-  // Fetch models
-  await loadModelsForPicker(p, setupModelPicker, info.default_model);
+  // Fetch models (with tool-use filter if checked)
+  await reloadSetupModels(p);
 }
 
 async function loadModelsForPicker(provider, picker, defaultModel, apiKey) {
@@ -1356,9 +1873,10 @@ async function submitSetup() {
       btn.disabled = false; btn.textContent = 'Save & Start'; return;
     }
     connect();
-    const cres = await fetch('/api/config');
-    currentCfg = await cres.json();
+    const cres2 = await fetch('/api/config');
+    currentCfg = await cres2.json();
     loadVersionInfo(currentCfg);
+    loadSessions();
     showPage('chat');
     addMsg('Setup complete! How can I help?', 'agent');
   } catch(e) {
@@ -1391,9 +1909,50 @@ function connect() {
       addMsg(msg.content, 'agent');
       sendBtn.disabled = false;
       inputEl.focus();
+      if (msg.token_usage) updateTokenBar(msg.token_usage);
+      if (msg.session_id) window._currentSessionId = msg.session_id;
+      loadSessions();
+    } else if (msg.type === 'token_update') {
+      updateTokenBar(msg);
+    } else if (msg.type === 'context_warning') {
+      updateTokenBar(msg.usage);
     } else if (msg.type === 'reset_ok') {
       chatEl.innerHTML = '';
       addMsg('Chat cleared. How can I help?', 'agent');
+      window._currentSessionId = null;
+      document.getElementById('token-bar-wrap').style.display = 'none';
+      document.getElementById('context-warning').style.display = 'none';
+      loadSessions();
+    } else if (msg.type === 'research_progress') {
+      const steps = document.getElementById('research-steps');
+      // Mark previous steps as done
+      steps.querySelectorAll('.step.active').forEach(s => {
+        s.classList.remove('active');
+        s.classList.add('done');
+        s.innerHTML = s.innerHTML.replace('⏳', '✅');
+      });
+      steps.innerHTML += `<div class="step active">⏳ ${msg.message}</div>`;
+    } else if (msg.type === 'research_complete') {
+      const steps = document.getElementById('research-steps');
+      steps.querySelectorAll('.step.active').forEach(s => {
+        s.classList.remove('active');
+        s.classList.add('done');
+        s.innerHTML = s.innerHTML.replace('⏳', '✅');
+      });
+      steps.innerHTML += '<div class="step done">✅ Research complete!</div>';
+      document.getElementById('research-result').style.display = 'block';
+      document.getElementById('research-meta').textContent =
+        `Completed in ${Math.round(msg.duration)}s · ${(msg.subtopics||[]).length} subtopics researched`;
+      document.getElementById('research-report-content').textContent = msg.report || '';
+      const btn = document.getElementById('research-start');
+      btn.disabled = false;
+      btn.textContent = 'Start Research';
+    } else if (msg.type === 'research_error') {
+      const steps = document.getElementById('research-steps');
+      steps.innerHTML += `<div class="step" style="color:var(--danger)">❌ Error: ${msg.error}</div>`;
+      const btn = document.getElementById('research-start');
+      btn.disabled = false;
+      btn.textContent = 'Start Research';
     }
   };
 }
@@ -1428,7 +1987,14 @@ function send() {
   sendBtn.disabled = true;
 }
 
-function resetChat() {
+async function resetChat() {
+  // Save current session first
+  if (window._currentSessionId) {
+    await fetch('/api/sessions/save', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({})
+    });
+  }
   if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'reset' }));
 }
 
