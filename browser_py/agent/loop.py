@@ -157,6 +157,11 @@ class Agent:
         self._abort = False  # set True to stop the loop on next iteration
         self._last_activity: dict[str, Any] = {}  # last tool call info + timestamp
 
+    def _get_timeout(self) -> int:
+        """Get LLM call timeout from config (default 300s)."""
+        cfg = get_agent_config()
+        return cfg.get("timeout", 300)
+
     def _build_system_prompt(self) -> str:
         """Build system prompt with current context usage stats."""
         from datetime import date as _date
@@ -237,7 +242,7 @@ class Agent:
             tools=self._tool_schemas,
             tool_choice="auto",
             max_tokens=4096,
-            timeout=120,  # 2 min — prevents orphaned threads on flush
+            timeout=self._get_timeout(),
         )
 
         # OpenRouter: use openai-compatible base_url so ALL model IDs work,

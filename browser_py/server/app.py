@@ -146,6 +146,7 @@ async def config() -> JSONResponse:
         "workspace": cfg.get("workspace"),
         "browser_profile": cfg.get("browser_profile"),
         "shell_enabled": cfg.get("shell_enabled", True),
+        "timeout": cfg.get("timeout", 300),
         "configured": is_configured(),
         "credentials": get_provider_credentials_status(),
     }
@@ -464,7 +465,7 @@ async def update_config(body: dict) -> JSONResponse:
     config = load_config()
     agent_cfg = config.get("agent", {})
 
-    allowed = {"model", "shell_enabled", "browser_profile"}
+    allowed = {"model", "shell_enabled", "browser_profile", "timeout"}
     for key in allowed:
         if key in body:
             agent_cfg[key] = body[key]
@@ -605,6 +606,8 @@ async def run_setup(body: dict) -> JSONResponse:
         agent_cfg["workspace"] = str(ws)
 
     agent_cfg["shell_enabled"] = shell_enabled
+    if body.get("timeout") is not None:
+        agent_cfg["timeout"] = int(body["timeout"])
 
     # Browser profile — create if needed
     if browser_profile:
@@ -1379,6 +1382,11 @@ _FALLBACK_HTML = """\
         <div class="field">
           <label>Browser Profile</label>
           <select id="cfg-profile"></select>
+        </div>
+        <div class="field">
+          <label>Subagent Timeout (seconds)</label>
+          <input type="number" id="cfg-timeout" min="30" max="3600" value="300">
+          <p style="font-size:11px;color:var(--text-dim);margin-top:4px">Max time per LLM call. Orphaned threads are killed after this.</p>
         </div>
       </div>
       <button class="btn" onclick="saveSettings()" style="width:100%;padding:10px">Save Settings</button>
@@ -2333,6 +2341,7 @@ async function loadSettingsPage() {
   document.getElementById('cfg-workspace').value = cfg.workspace || '';
   // Shell
   document.getElementById('cfg-shell').checked = cfg.shell_enabled !== false;
+  document.getElementById('cfg-timeout').value = cfg.timeout || 300;
 
   // Profiles dropdown
   const pres = await fetch('/api/profiles');
@@ -2386,8 +2395,9 @@ async function saveSettings() {
   const workspace = document.getElementById('cfg-workspace').value.trim();
   const shell_enabled = document.getElementById('cfg-shell').checked;
   const browser_profile = document.getElementById('cfg-profile').value;
+  const timeout = parseInt(document.getElementById('cfg-timeout').value) || 300;
 
-  const body = { provider, model, workspace, browser_profile, shell_enabled };
+  const body = { provider, model, workspace, browser_profile, shell_enabled, timeout };
 
   // Collect credentials
   if (info.fields) {
