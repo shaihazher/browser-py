@@ -1451,6 +1451,7 @@ _FALLBACK_HTML = """\
         <div class="wizard-step" data-step="3"></div>
         <div class="wizard-step" data-step="4"></div>
         <div class="wizard-step" data-step="5"></div>
+        <div class="wizard-step" data-step="6"></div>
       </div>
 
       <!-- Step 1: Provider + Key -->
@@ -1526,30 +1527,38 @@ _FALLBACK_HTML = """\
             <button class="btn secondary" onclick="setupCreateProfile()" style="white-space:nowrap">Create</button>
           </div>
         </div>
-        <div class="card" style="background:rgba(88,166,255,0.06);border-color:rgba(88,166,255,0.2)">
-          <h3>🌍 Log in to your accounts (optional)</h3>
-          <p>Click the button below to open the browser. Log in to any sites you want the agent to access — Gmail, GitHub, social media, etc. Your sessions will be saved to this profile.</p>
-          <p style="color:var(--text-dim);font-size:12px;margin-top:4px">You can skip this and do it later from the sidebar.</p>
-          <button class="btn" onclick="setupLaunchBrowser()" id="setup-launch-browser" style="margin-top:10px">🌍 Open Browser</button>
-          <span id="setup-browser-status" style="font-size:12px;color:var(--text-dim);margin-left:8px"></span>
-        </div>
         <div class="wizard-nav">
           <button class="btn secondary" onclick="wizardBack(4)">← Back</button>
           <button class="btn" onclick="wizardNext(4)">Next →</button>
         </div>
       </div>
 
-      <!-- Step 5: Permissions + Finish -->
+      <!-- Step 5: Launch Browser + Login (optional) -->
       <div class="wizard-section" id="wizard-5">
+        <div class="card" style="background:rgba(88,166,255,0.06);border-color:rgba(88,166,255,0.2)">
+          <h3>🌍 Log in to your accounts</h3>
+          <p>Click the button below to open the browser. Log in to any sites you want the agent to access — Gmail, GitHub, social media, etc. Your sessions will be saved to the profile you just selected.</p>
+          <p style="color:var(--text-dim);font-size:12px;margin-top:8px">This is optional — you can always do it later from the sidebar.</p>
+          <button class="btn" onclick="setupLaunchBrowser()" id="setup-launch-browser" style="margin-top:12px">🌍 Open Browser</button>
+          <span id="setup-browser-status" style="font-size:12px;color:var(--text-dim);margin-left:8px"></span>
+        </div>
+        <div class="wizard-nav">
+          <button class="btn secondary" onclick="wizardBack(5)">← Back</button>
+          <button class="btn" onclick="wizardNext(5)">Next →</button>
+        </div>
+      </div>
+
+      <!-- Step 6: Permissions + Finish -->
+      <div class="wizard-section" id="wizard-6">
         <div class="card">
-          <h3>Step 5: Permissions</h3>
+          <h3>Step 6: Permissions</h3>
           <div class="field" style="display:flex;align-items:center;gap:8px">
             <input type="checkbox" id="setup-shell" style="width:auto" checked>
             <label for="setup-shell" style="margin:0;text-transform:none">Allow shell commands</label>
           </div>
         </div>
         <div class="wizard-nav">
-          <button class="btn secondary" onclick="wizardBack(5)">← Back</button>
+          <button class="btn secondary" onclick="wizardBack(6)">← Back</button>
           <button class="btn" onclick="submitSetup()" id="setup-submit" style="flex:2">Save &amp; Start</button>
         </div>
       </div>
@@ -2163,7 +2172,7 @@ function wizardBack(step) {
   renderWizard();
 }
 function renderWizard() {
-  for (let i = 1; i <= 5; i++) {
+  for (let i = 1; i <= 6; i++) {
     const sec = document.getElementById('wizard-' + i);
     sec.classList.toggle('active', i === wizardStep);
     const stepEl = document.querySelector(`.wizard-step[data-step="${i}"]`);
@@ -2359,7 +2368,9 @@ async function setupCreateProfile() {
   if (data.error) { alert(data.error); return; }
   nameInput.value = '';
   await loadSetupProfiles();
-  document.getElementById('setup-browser-profile').value = name;
+  // Use the actual profile name from the API (may be sanitized/lowercased)
+  const createdName = data.profile?.name || name.toLowerCase();
+  document.getElementById('setup-browser-profile').value = createdName;
 }
 
 async function submitSetup() {
